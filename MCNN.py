@@ -202,7 +202,7 @@ if __name__ == '__main__':
     print("Class distribution:\n", df[Config.LABEL_COLUMN].value_counts(normalize=True))
     
     df_train, df_temp = train_test_split(df, test_size=0.3, random_state=Config.RANDOM_STATE, stratify=df[Config.LABEL_COLUMN])
-    df_val, df_test = train_test_split(df_temp, test_size=0.5, random_state=Config.RANDOM_STATE, stratify=df_temp['label'])
+    df_val, df_test = train_test_split(df_temp, test_size=0.5, random_state=Config.RANDOM_STATE, stratify=df_temp[Config.LABEL_COLUMN])
 
     tokenizer = AutoTokenizer.from_pretrained(Config.PRE_TRAINED_MODEL_NAME)
     image_transform = transforms.Compose([
