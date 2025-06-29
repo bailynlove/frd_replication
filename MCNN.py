@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Replication of MCNN for Fake Review Detection on Yelp Dataset (Corrected Version)
+Strict Replication of MCNN with Multi-task Learning Framework
 
-This script implements the core components of the MCNN paper (Xue et al., 2021)
-and adapts them for the Yelp multimodal review dataset.
+This script strictly implements the dual-loss mechanism described in the
+MCNN paper (Xue et al., 2021), as requested.
 
-Correction Log:
--   Fixed the critical bug in MCNN.__init__ where a Tokenizer was used instead of a Model.
--   The MCNN class now correctly loads the BertModel and freezes its parameters.
--   The Tokenizer is now correctly initialized in the main script flow for the Dataset.
+Implementation Details:
+1.  The MCNN model has two output heads: a classification head and a similarity head.
+2.  The loss function is a weighted sum of a classification loss (Lp) and a
+    similarity loss (Ls), following the formula L = α*Lp + β*Ls.
+3.  The dataset is assumed to be class-balanced.
 """
 import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
-from transformers import AutoTokenizer, BertModel  # <-- 显式导入 BertModel
+from transformers import AutoTokenizer, BertModel
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
@@ -28,14 +29,12 @@ warnings.filterwarnings('ignore')
 
 # --- 1. 全局配置 ---
 class Config:
-    # 路径 (根据您的设置)
     CSV_PATH = '../../spams_detection/datasets/crawler/LA/outputs/full_data_0617.csv'
     IMAGE_DIR = '../../spams_detection/datasets/crawler/LA/image/'
     TEXT_COLUMN = 'content'
     LABEL_COLUMN = 'is_recommended'
     IMAGE_IDS_COLUMN = 'photo_ids'
 
-    # 模型超参数
     PRE_TRAINED_MODEL_NAME = 'bert-base-uncased'
     MAX_TEXT_LEN = 128
     MAX_IMAGES = 4
@@ -46,111 +45,85 @@ class Config:
     GRU_HIDDEN_DIM = 256
     SHARED_DIM = 256
 
-    # 训练参数
     BATCH_SIZE = 8
     EPOCHS = 5
     LEARNING_RATE = 1e-4
+    
+    # 论文中提到的联合损失权重
+    ALPHA = 0.7  # 分类损失的权重
+    BETA = 0.3   # 相似度损失的权重
 
-    # 数据集划分
-    TRAIN_SIZE = 0.7
     RANDOM_STATE = 42
 
-# --- 2. 设备检查 (根据您的设置) ---
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print("✅ CUDA is available! Using CUDA as the device.")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("✅ MPS is available! Using MPS as the device.")
-else:
-    device = torch.device("cpu")
-    print("⚠️ CUDA/MPS not available, using CPU.")
-
+# --- 2. 设备检查 ---
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+print(f"--- Using device: {device} ---")
 
 # --- 3. 多模态数据集类 (无变化) ---
 class YelpMultimodalDataset(Dataset):
     def __init__(self, dataframe, tokenizer, image_transform, config):
-        self.df = dataframe
-        self.tokenizer = tokenizer
-        self.image_transform = image_transform
-        self.config = config
-
-    def __len__(self):
-        return len(self.df)
-
+        self.df, self.tokenizer, self.image_transform, self.config = dataframe, tokenizer, image_transform, config
+    def __len__(self): return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        
-        # 文本处理
         text = str(row[self.config.TEXT_COLUMN])
         text_encoding = self.tokenizer.encode_plus(
             text, add_special_tokens=True, max_length=self.config.MAX_TEXT_LEN,
             padding='max_length', truncation=True, return_tensors='pt'
         )
-        
-        # 图像处理
         image_ids_str = row.get(self.config.IMAGE_IDS_COLUMN)
         image_tensors = []
         if pd.notna(image_ids_str):
-            image_ids = image_ids_str.split('#')
-            for img_id in image_ids[:self.config.MAX_IMAGES]:
+            image_ids = image_ids_str.split('#')[:self.config.MAX_IMAGES]
+            for img_id in image_ids:
                 img_path = os.path.join(self.config.IMAGE_DIR, f"{img_id}.jpg")
                 try:
                     image = Image.open(img_path).convert('RGB')
                     image_tensors.append(self.image_transform(image))
-                except (FileNotFoundError, IOError):
-                    continue
-        
-        num_images_found = len(image_tensors)
+                except (FileNotFoundError, IOError): continue
         while len(image_tensors) < self.config.MAX_IMAGES:
             image_tensors.append(torch.zeros((3, self.config.IMG_SIZE, self.config.IMG_SIZE)))
-
-        images = torch.stack(image_tensors)
-        
         return {
             'input_ids': text_encoding['input_ids'].flatten(),
             'attention_mask': text_encoding['attention_mask'].flatten(),
-            'images': images,
+            'images': torch.stack(image_tensors),
             'label': torch.tensor(row[self.config.LABEL_COLUMN], dtype=torch.long)
         }
 
-# --- 4. MCNN 模型架构 (已修正) ---
+# --- 4. MCNN 模型架构 (多任务学习版) ---
 class MCNN(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        # --- 文本子网络 ---
-        # 【关键修正点】加载 BertModel 而不是 Tokenizer
+        # --- 特征提取器 (与之前相同) ---
         self.bert = BertModel.from_pretrained(config.PRE_TRAINED_MODEL_NAME)
-        # 现在可以正确地冻结模型参数了
-        for param in self.bert.parameters():
-            param.requires_grad = False
-            
-        self.text_gru = nn.GRU(
-            input_size=config.BERT_DIM, hidden_size=config.GRU_HIDDEN_DIM,
-            num_layers=1, batch_first=True, bidirectional=True
-        )
-        
-        # --- 图像子网络 ---
-        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1) # 使用推荐的权重加载方式
+        self.text_gru = nn.GRU(config.BERT_DIM, config.GRU_HIDDEN_DIM, 1, batch_first=True, bidirectional=True)
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         self.resnet = nn.Sequential(*list(resnet.children())[:-1])
-        for param in self.resnet.parameters():
-            param.requires_grad = False
-            
-        self.image_gru = nn.GRU(
-            input_size=config.RESNET_DIM, hidden_size=config.GRU_HIDDEN_DIM,
-            num_layers=1, batch_first=True, bidirectional=True
-        )
+        self.image_gru = nn.GRU(config.RESNET_DIM, config.GRU_HIDDEN_DIM, 1, batch_first=True, bidirectional=True)
+        
+        # 冻结预训练模型
+        for p in self.bert.parameters(): p.requires_grad = False
+        for p in self.resnet.parameters(): p.requires_grad = False
 
-        # --- 相似度模块 ---
+        # --- 相似度模块 (与之前相同) ---
         self.shared_fc = nn.Linear(config.GRU_HIDDEN_DIM * 2, config.SHARED_DIM)
         
-        # --- 融合与分类模块 ---
-        fusion_input_dim = (config.GRU_HIDDEN_DIM * 2) * 2 + 1
-        self.fusion_classifier = nn.Sequential(
-            nn.Linear(fusion_input_dim, 512), nn.ReLU(),
-            nn.Dropout(0.5), nn.Linear(512, 2)
+        # --- 两个独立的输出头 ---
+        # 1. 相似度头 (Similarity Head)
+        self.similarity_head = nn.Sequential(
+            nn.Linear(config.SHARED_DIM * 2, 1), # 输入拼接后的图文共享特征，输出一个相似度logit
+            nn.Sigmoid() # 将logit压缩到0-1之间
+        )
+
+        # 2. 分类头 (Classification Head)
+        fusion_input_dim = (config.GRU_HIDDEN_DIM * 2) * 2 # 仅融合图文特征
+        self.classification_head = nn.Sequential(
+            nn.Linear(fusion_input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 2)
         )
 
     def forward(self, input_ids, attention_mask, images):
@@ -162,38 +135,54 @@ class MCNN(nn.Module):
         # 2. 图像特征提取
         batch_size = images.shape[0]
         image_features_flat = self.resnet(images.view(-1, 3, self.config.IMG_SIZE, self.config.IMG_SIZE))
-        image_features_flat = image_features_flat.view(image_features_flat.size(0), -1)
         image_features_seq = image_features_flat.view(batch_size, self.config.MAX_IMAGES, -1)
         _, image_hidden = self.image_gru(image_features_seq)
         image_feat_vec = torch.cat([image_hidden[0], image_hidden[1]], dim=1)
         
-        # 3. 相似度计算
+        # 3. 相似度预测
         text_shared = self.shared_fc(text_feat_vec)
         image_shared = self.shared_fc(image_feat_vec)
-        cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-        similarity = cos(text_shared, image_shared).unsqueeze(1)
+        # 论文中没有明确说明相似度头的输入，一种合理的实现是拼接共享特征
+        similarity_input = torch.cat([text_shared, image_shared], dim=1)
+        similarity_pred = self.similarity_head(similarity_input).squeeze(-1) # (batch_size)
         
-        # 4. 特征融合与分类
-        fused_features = torch.cat([text_feat_vec, image_feat_vec, similarity], dim=1)
-        logits = self.fusion_classifier(fused_features)
+        # 4. 分类预测
+        classification_input = torch.cat([text_feat_vec, image_feat_vec], dim=1)
+        classification_logits = self.classification_head(classification_input)
         
-        return logits
+        return classification_logits, similarity_pred
 
-# --- 5. 训练和评估流程 ---
-def train_epoch(model, loader, optimizer, loss_fn, device):
+# --- 5. 训练和评估流程 (已修改以支持多任务) ---
+def train_epoch(model, loader, optimizer, classification_loss_fn, similarity_loss_fn, device, alpha, beta):
     model.train()
     total_loss = 0
     for batch in tqdm(loader, desc="Training"):
         optimizer.zero_grad()
-        logits = model(
+        
+        classification_logits, similarity_pred = model(
             input_ids=batch['input_ids'].to(device),
             attention_mask=batch['attention_mask'].to(device),
             images=batch['images'].to(device)
         )
-        loss = loss_fn(logits, batch['label'].to(device))
-        loss.backward()
+        
+        labels = batch['label'].to(device)
+        
+        # 计算分类损失 (Lp)
+        loss_p = classification_loss_fn(classification_logits, labels)
+        
+        # 计算相似度损失 (Ls)
+        # 目标：真实评论(1)应该有高相似度(接近1)，虚假评论(0)应该有低相似度(接近0)
+        # 所以，相似度任务的目标标签就是主任务的标签
+        similarity_target = labels.float()
+        loss_s = similarity_loss_fn(similarity_pred, similarity_target)
+        
+        # 计算联合损失
+        total_batch_loss = alpha * loss_p + beta * loss_s
+        
+        total_batch_loss.backward()
         optimizer.step()
-        total_loss += loss.item()
+        total_loss += total_batch_loss.item()
+        
     return total_loss / len(loader)
 
 def evaluate(model, loader, device):
@@ -201,38 +190,35 @@ def evaluate(model, loader, device):
     all_preds, all_labels = [], []
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
-            logits = model(
+            # 评估时，我们只关心分类头的输出
+            classification_logits, _ = model(
                 input_ids=batch['input_ids'].to(device),
                 attention_mask=batch['attention_mask'].to(device),
                 images=batch['images'].to(device)
             )
-            preds = torch.argmax(logits, dim=1)
+            preds = torch.argmax(classification_logits, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch['label'].numpy())
+            
     return accuracy_score(all_labels, all_preds), f1_score(all_labels, all_preds, average='macro')
 
 # --- 6. 主执行流程 ---
 if __name__ == '__main__':
     print("\n--- Step 1: Loading and Preparing Data ---")
-    try:
-        df = pd.read_csv(Config.CSV_PATH)
-    except FileNotFoundError:
-        print(f"Error: Data file not found at {Config.CSV_PATH}")
-        exit()
-        
+    df = pd.read_csv(Config.CSV_PATH)
+    # 只使用带图片的评论
     df = df[df[Config.IMAGE_IDS_COLUMN].notna()].copy()
-    # if len(df) > 2000:
-    #     df = df.sample(n=2000, random_state=Config.RANDOM_STATE)
-    df = df.reset_index(drop=True)
-    print(f"Using {len(df)} samples with images for demonstration.")
     
-    df_train, df_test = train_test_split(df, train_size=Config.TRAIN_SIZE, random_state=Config.RANDOM_STATE, stratify=df[Config.LABEL_COLUMN])
+    # 既然数据集是平衡的，我们可以直接使用，无需额外采样
+    print(f"Using full balanced dataset of {len(df)} samples with images.")
+    print("Class distribution:")
+    print(df[Config.LABEL_COLUMN].value_counts(normalize=True))
     
-    # 【关键修正点】Tokenizer 在这里初始化
+    df_train, df_test = train_test_split(df, test_size=0.3, random_state=Config.RANDOM_STATE, stratify=df[Config.LABEL_COLUMN])
+
     tokenizer = AutoTokenizer.from_pretrained(Config.PRE_TRAINED_MODEL_NAME)
     image_transform = transforms.Compose([
-        transforms.Resize((Config.IMG_SIZE, Config.IMG_SIZE)),
-        transforms.ToTensor(),
+        transforms.Resize((Config.IMG_SIZE, Config.IMG_SIZE)), transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
@@ -242,20 +228,26 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, num_workers=4, pin_memory=True)
 
-    print("\n--- Step 2: Initializing MCNN Model ---")
+    print("\n--- Step 2: Initializing MCNN Model (Multi-task Version) ---")
     model = MCNN(Config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
-    loss_fn = nn.CrossEntropyLoss()
+    # 为两个任务准备不同的损失函数
+    classification_loss_fn = nn.CrossEntropyLoss()
+    similarity_loss_fn = nn.BCELoss() # 二元交叉熵，适用于0-1之间的相似度预测
 
     print("\n--- Step 3: Starting Training ---")
     for epoch in range(Config.EPOCHS):
-        avg_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
-        print(f"Epoch {epoch + 1}/{Config.EPOCHS} - Avg. Training Loss: {avg_loss:.4f}")
+        avg_loss = train_epoch(
+            model, train_loader, optimizer,
+            classification_loss_fn, similarity_loss_fn,
+            device, Config.ALPHA, Config.BETA
+        )
+        print(f"Epoch {epoch + 1}/{Config.EPOCHS} - Avg. Joint Training Loss: {avg_loss:.4f}")
 
     print("\n--- Step 4: Evaluating on Test Set ---")
     accuracy, f1 = evaluate(model, test_loader, device)
     
-    print("\n--- Final MCNN Baseline Results ---")
+    print("\n--- Final MCNN (Multi-task) Baseline Results ---")
     print(f"Test Accuracy: {accuracy:.4f}")
     print(f"Test F1-score (Macro): {f1:.4f}")
-    print("-----------------------------------")
+    print("--------------------------------------------------")
