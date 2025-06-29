@@ -34,8 +34,8 @@ warnings.filterwarnings('ignore')
 # --- 1. 全局配置 ---
 class Config:
     # 数据路径
-    CSV_PATH = '../spams_dataset/LA/outputs/full_data_0617.csv'
-    IMAGE_DIR = './image/'  # 你的图片文件夹路径
+    CSV_PATH = '../../spams_detection/LA/outputs/full_data_0617.csv'
+    IMAGE_DIR = '../../spams_detection/LA/image/'  # 你的图片文件夹路径
     TEXT_COLUMN = 'content'
     LABEL_COLUMN = 'is_recommended'
     IMAGE_IDS_COLUMN = 'photo_ids'
