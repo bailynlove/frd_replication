@@ -11,7 +11,7 @@ import numpy as np
 # --- 1. 配置参数 ---
 # 在这里可以方便地修改所有超参数
 class Config:
-    CSV_PATH = '../spams_dataset/LA/outputs/full_data_0617.csv' # 你的数据集路径
+    CSV_PATH = '../../spams_detection/datasets/crawler/LA/outputs/full_data_0617.csv' # 你的数据集路径
     TEXT_COLUMN = 'content'
     LABEL_COLUMN = 'is_recommended'
     

@@ -24,20 +24,8 @@ from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similar
 from imblearn.over_sampling import SMOTE
 
 # --- 0. 环境准备与设备检测 ---
-try:
-    stopwords.words('english')
-except LookupError:
-    print("Downloading NLTK data...")
-    nltk.download('punkt')
-    nltk.download('stopwords')
-    nltk.download('averaged_perceptron_tagger')
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print("MPS device found. Using GPU for acceleration where possible.")
-else:
-    device = torch.device("cpu")
-    print("MPS device not found. Using CPU for all computations.")
 
 # --- 1. 数据加载与预处理 (无变化) ---
 def load_and_prepare_data(filepath='full_data_0617.csv'):
@@ -174,7 +162,7 @@ def train_and_evaluate(X, y):
 # --- 主函数执行流程 ---
 if __name__ == '__main__':
     try:
-        df = load_and_prepare_data('../spams_dataset/LA/outputs/full_data_0617.csv')
+        df = load_and_prepare_data('../../spams_detection/datasets/crawler/LA/outputs/full_data_0617.csv')
         doc2vec_vectors, doc2vec_model, df = train_and_vectorize_doc2vec(df)
         df = calculate_suspicion_degree(df)
         feature_matrix = extract_other_features(df, doc2vec_vectors)

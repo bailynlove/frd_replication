@@ -8,7 +8,7 @@ import numpy as np
 
 # --- 1. 配置参数 ---
 class Config:
-    CSV_PATH = '../spams_dataset/LA/outputs/full_data_0617.csv'
+    CSV_PATH = '../../spams_detection/datasets/crawler/LA/outputs/full_data_0617.csv'
     TEXT_COLUMN = 'content'
     LABEL_COLUMN = 'is_recommended'
     PRE_TRAINED_MODEL_NAME = 'roberta-base'
@@ -21,7 +21,7 @@ class Config:
     LOG_EVAL_SAVE_STEPS = 500
 
 # --- 2. 检查并设置设备 ---
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"--- Using device: {device} ---")
 
 # --- 3. 定义评估指标计算函数 ---
