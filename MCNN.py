@@ -221,8 +221,8 @@ if __name__ == '__main__':
         exit()
         
     df = df[df[Config.IMAGE_IDS_COLUMN].notna()].copy()
-    if len(df) > 2000:
-        df = df.sample(n=2000, random_state=Config.RANDOM_STATE)
+    # if len(df) > 2000:
+    #     df = df.sample(n=2000, random_state=Config.RANDOM_STATE)
     df = df.reset_index(drop=True)
     print(f"Using {len(df)} samples with images for demonstration.")
     
