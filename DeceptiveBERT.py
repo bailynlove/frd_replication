@@ -259,7 +259,7 @@ if __name__ == '__main__':
         
         print(f'Train loss {train_loss}')
 
-        val_acc, val_f1, val_loss = eval_model(
+        val_acc, val_pre, val_rec, val_f1, val_loss = eval_model(
             model,
             val_data_loader,
             loss_fn,
