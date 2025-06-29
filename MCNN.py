@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Strict Replication of MCNN with Multi-task Learning Framework (Enhanced Version)
+Strict Replication of MCNN with Data Balancing (Final Version for Consistent Metrics)
 
-This script strictly implements the dual-loss mechanism from the MCNN paper.
+This script implements the MCNN model with oversampling to handle class imbalance.
 
-Enhancements:
-1.  **Comprehensive Metrics**: Evaluation now includes Accuracy, Macro F1-score,
-    and Precision/Recall/F1-score specifically for the 'Fake' class.
-2.  **Best Model Saving**: During training, the model with the best F1-score
-    on the validation set is saved.
-3.  **Load & Test**: The script will load the best saved model for final testing.
-4.  **Result Persistence**: Test predictions and labels are saved to a CSV file
-    for future analysis without re-training.
+Final Evaluation Logic:
+-   Metrics are calculated using the standard 'binary' average setting in scikit-learn.
+-   This means Precision, Recall, and F1-score are calculated for the positive class (label=1, 'Real Class').
+-   This ensures consistency for comparison with other models.
 """
 import pandas as pd
 import torch
@@ -23,10 +19,10 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from imblearn.over_sampling import RandomOverSampler
 import os
 import warnings
-import json
 
 warnings.filterwarnings('ignore')
 
@@ -37,32 +33,17 @@ class Config:
     TEXT_COLUMN = 'content'
     LABEL_COLUMN = 'is_recommended'
     IMAGE_IDS_COLUMN = 'photo_ids'
-
-    # 定义哪个标签代表“虚假评论”，以便计算相关指标
-    FAKE_CLASS_LABEL = 0 
+    
+    # 在二元计算中，1被认为是正类 (positive class)
+    POSITIVE_CLASS_LABEL = 1 
 
     PRE_TRAINED_MODEL_NAME = 'bert-base-uncased'
-    MAX_TEXT_LEN = 128
-    MAX_IMAGES = 4
-    IMG_SIZE = 224
-    
-    BERT_DIM = 768
-    RESNET_DIM = 2048
-    GRU_HIDDEN_DIM = 256
-    SHARED_DIM = 256
-
-    BATCH_SIZE = 8
-    EPOCHS = 5
-    LEARNING_RATE = 1e-4
-    
-    ALPHA = 0.7
-    BETA = 0.3
-
+    MAX_TEXT_LEN, MAX_IMAGES, IMG_SIZE = 128, 4, 224
+    BERT_DIM, RESNET_DIM, GRU_HIDDEN_DIM, SHARED_DIM = 768, 2048, 256, 256
+    BATCH_SIZE, EPOCHS, LEARNING_RATE = 8, 5, 1e-4
+    ALPHA, BETA = 0.7, 0.3
     RANDOM_STATE = 42
-    
-    # 文件保存路径
-    MODEL_SAVE_PATH = "./best_mcnn_model.pth"
-    RESULTS_SAVE_PATH = "./mcnn_test_predictions.csv"
+    MODEL_SAVE_PATH = "./best_mcnn_model_balanced.pth"
 
 # --- 2. 设备检查 ---
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -100,13 +81,11 @@ class YelpMultimodalDataset(Dataset):
             'label': torch.tensor(row[self.config.LABEL_COLUMN], dtype=torch.long)
         }
 
-
 # --- 4. MCNN 模型架构 (无变化) ---
 class MCNN(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.bert = BertModel.from_pretrained(config.PRE_TRAINED_MODEL_NAME)
+        self.config, self.bert = config, BertModel.from_pretrained(config.PRE_TRAINED_MODEL_NAME)
         self.text_gru = nn.GRU(config.BERT_DIM, config.GRU_HIDDEN_DIM, 1, batch_first=True, bidirectional=True)
         resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         self.resnet = nn.Sequential(*list(resnet.children())[:-1])
@@ -114,12 +93,9 @@ class MCNN(nn.Module):
         for p in self.bert.parameters(): p.requires_grad = False
         for p in self.resnet.parameters(): p.requires_grad = False
         self.shared_fc = nn.Linear(config.GRU_HIDDEN_DIM * 2, config.SHARED_DIM)
-        self.similarity_head = nn.Sequential(
-            nn.Linear(config.SHARED_DIM * 2, 1), nn.Sigmoid()
-        )
-        fusion_input_dim = (config.GRU_HIDDEN_DIM * 2) * 2
+        self.similarity_head = nn.Sequential(nn.Linear(config.SHARED_DIM * 2, 1), nn.Sigmoid())
         self.classification_head = nn.Sequential(
-            nn.Linear(fusion_input_dim, 512), nn.ReLU(),
+            nn.Linear((config.GRU_HIDDEN_DIM * 2) * 2, 512), nn.ReLU(),
             nn.Dropout(0.5), nn.Linear(512, 2)
         )
     def forward(self, input_ids, attention_mask, images):
@@ -137,10 +113,9 @@ class MCNN(nn.Module):
         return classification_logits, similarity_pred
 
 
-# --- 5. 训练和评估流程 (已增强) ---
+# --- 5. 训练和评估流程 (评估函数已修改) ---
 def train_epoch(model, loader, optimizer, classification_loss_fn, similarity_loss_fn, device, alpha, beta):
     model.train()
-    total_loss = 0
     for batch in tqdm(loader, desc="Training"):
         optimizer.zero_grad()
         classification_logits, similarity_pred = model(
@@ -150,16 +125,12 @@ def train_epoch(model, loader, optimizer, classification_loss_fn, similarity_los
         )
         labels = batch['label'].to(device)
         loss_p = classification_loss_fn(classification_logits, labels)
-        similarity_target = labels.float()
-        loss_s = similarity_loss_fn(similarity_pred, similarity_target)
+        loss_s = similarity_loss_fn(similarity_pred, labels.float())
         total_batch_loss = alpha * loss_p + beta * loss_s
         total_batch_loss.backward()
         optimizer.step()
-        total_loss += total_batch_loss.item()
-    return total_loss / len(loader)
 
-def get_predictions(model, loader, device):
-    """只获取预测结果和真实标签，用于评估。"""
+def get_predictions_and_evaluate(model, loader, device):
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -172,45 +143,52 @@ def get_predictions(model, loader, device):
             preds = torch.argmax(classification_logits, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(batch['label'].numpy())
-    return np.array(all_labels), np.array(all_preds)
-
-def print_metrics(y_true, y_pred, fake_class_label):
-    """打印所有需要的指标。"""
-    print("\n--- Overall Performance ---")
-    print(f"Accuracy: {accuracy_score(y_true, y_pred):.4f}")
-    print(f"F1-score: {f1_score(y_true, y_pred):.4f}")
     
-    print(f"\n--- Metrics for FAKE Class (Label: {fake_class_label}) ---")
-    precision = precision_score(y_true, y_pred, pos_label=fake_class_label, zero_division=0)
-    recall = recall_score(y_true, y_pred, pos_label=fake_class_label, zero_division=0)
-    f1 = f1_score(y_true, y_pred, pos_label=fake_class_label, zero_division=0)
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1-score: {f1:.4f}")
+    y_true, y_pred = np.array(all_labels), np.array(all_preds)
     
-    print("\n--- Full Classification Report ---")
-    print(classification_report(y_true, y_pred, target_names=['Fake (0)', 'Real (1)'], zero_division=0))
+    # --- 【关键修改点】计算您要求的常规指标 ---
+    # `average='binary'` 是默认行为，计算的是正类（label=1）的指标
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='binary', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='binary', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='binary', zero_division=0)
+    
+    # 我们也计算宏平均F1作为参考
+    macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    return accuracy, precision, recall, f1, macro_f1
 
 
 # --- 6. 主执行流程 ---
 if __name__ == '__main__':
-    # --- 数据加载与准备 ---
-    print("\n--- Step 1: Loading and Preparing Data ---")
+    # Step 1: 数据加载与过滤
+    print("\n--- Step 1: Loading and Filtering Data ---")
     df = pd.read_csv(Config.CSV_PATH)
     df = df[df[Config.IMAGE_IDS_COLUMN].notna()].copy().reset_index(drop=True)
-    print(f"Using {len(df)} samples with images.")
-    print("Class distribution:\n", df[Config.LABEL_COLUMN].value_counts(normalize=True))
+    print(f"Filtered to {len(df)} samples with images.")
+    print("Initial class distribution:\n", df[Config.LABEL_COLUMN].value_counts(normalize=True))
     
-    df_train, df_temp = train_test_split(df, test_size=0.3, random_state=Config.RANDOM_STATE, stratify=df[Config.LABEL_COLUMN])
-    df_val, df_test = train_test_split(df_temp, test_size=0.5, random_state=Config.RANDOM_STATE, stratify=df_temp[Config.LABEL_COLUMN])
-
+    # Step 2: 数据集划分
+    df_train, df_test = train_test_split(df, test_size=0.3, random_state=Config.RANDOM_STATE, stratify=df[Config.LABEL_COLUMN])
+    df_val, df_test = train_test_split(df_test, test_size=0.5, random_state=Config.RANDOM_STATE, stratify=df_test[Config.LABEL_COLUMN])
+    
+    # Step 3: 对训练集进行过采样
+    print("\n--- Step 3: Applying RandomOversampling to the Training Set ---")
+    ros = RandomOverSampler(random_state=Config.RANDOM_STATE)
+    train_indices = df_train.index.to_numpy().reshape(-1, 1)
+    train_labels = df_train[Config.LABEL_COLUMN].to_numpy()
+    resampled_indices, _ = ros.fit_resample(train_indices, train_labels)
+    df_train_balanced = df.iloc[resampled_indices.flatten()].reset_index(drop=True)
+    print("Balanced training set distribution:\n", df_train_balanced[Config.LABEL_COLUMN].value_counts())
+    
+    # Step 4: 创建DataLoaders
     tokenizer = AutoTokenizer.from_pretrained(Config.PRE_TRAINED_MODEL_NAME)
     image_transform = transforms.Compose([
         transforms.Resize((Config.IMG_SIZE, Config.IMG_SIZE)), transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    train_dataset = YelpMultimodalDataset(df_train, tokenizer, image_transform, Config)
+    train_dataset = YelpMultimodalDataset(df_train_balanced, tokenizer, image_transform, Config)
     val_dataset = YelpMultimodalDataset(df_val, tokenizer, image_transform, Config)
     test_dataset = YelpMultimodalDataset(df_test, tokenizer, image_transform, Config)
     
@@ -218,52 +196,37 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, num_workers=4, pin_memory=True)
 
-    # --- 模型训练与保存 ---
-    print("\n--- Step 2: Training MCNN Model ---")
+    # Step 5: 模型训练与保存
+    print("\n--- Step 5: Training MCNN Model ---")
     model = MCNN(Config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
     classification_loss_fn = nn.CrossEntropyLoss()
     similarity_loss_fn = nn.BCELoss()
 
     best_val_f1 = -1.0
-
     for epoch in range(Config.EPOCHS):
-        avg_loss = train_epoch(
-            model, train_loader, optimizer,
-            classification_loss_fn, similarity_loss_fn,
-            device, Config.ALPHA, Config.BETA
-        )
-        print(f"Epoch {epoch + 1}/{Config.EPOCHS} - Avg. Joint Training Loss: {avg_loss:.4f}")
+        train_epoch(model, train_loader, optimizer, classification_loss_fn, similarity_loss_fn, device, Config.ALPHA, Config.BETA)
         
-        # 在验证集上评估并保存最佳模型
-        val_labels, val_preds = get_predictions(model, val_loader, device)
-        val_f1_fake_class = f1_score(val_labels, val_preds, pos_label=Config.FAKE_CLASS_LABEL, average='binary')
+        # 我们使用宏平均F1来选择最佳模型，因为它能均衡地反映模型对两个类的识别能力
+        _, _, _, _, val_macro_f1 = get_predictions_and_evaluate(model, val_loader, device)
+        print(f"Epoch {epoch + 1}/{Config.EPOCHS} - Validation Macro F1-score: {val_macro_f1:.4f}")
         
-        print(f"Validation F1-score (Fake Class): {val_f1_fake_class:.4f}")
-        
-        if val_f1_fake_class > best_val_f1:
-            best_val_f1 = val_f1_fake_class
+        if val_macro_f1 > best_val_f1:
+            best_val_f1 = val_macro_f1
             torch.save(model.state_dict(), Config.MODEL_SAVE_PATH)
-            print(f"✨ New best model saved to {Config.MODEL_SAVE_PATH} with F1-score: {best_val_f1:.4f}")
+            print(f"✨ New best model saved with Macro F1: {best_val_f1:.4f}")
 
-    # --- 模型评估与结果保存 ---
-    print("\n--- Step 3: Evaluating Best Model on Test Set ---")
-    # 加载表现最好的模型
+    # Step 6: 最终评估
+    print("\n--- Step 6: Final Evaluation on Test Set ---")
     model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH))
-    print(f"Loaded best model from {Config.MODEL_SAVE_PATH}")
     
-    # 获取测试集预测结果
-    test_labels, test_preds = get_predictions(model, test_loader, device)
+    accuracy, precision, recall, f1, _ = get_predictions_and_evaluate(model, test_loader, device)
     
-    # 打印所有指标
-    print_metrics(test_labels, test_preds, Config.FAKE_CLASS_LABEL)
-    
-    # 保存预测结果和真实标签到CSV文件
-    results_df = pd.DataFrame({
-        'true_label': test_labels,
-        'predicted_label': test_preds
-    })
-    # 可以将原始文本也加入，方便分析
-    results_df = pd.concat([df_test.reset_index(drop=True), results_df], axis=1)
-    results_df.to_csv(Config.RESULTS_SAVE_PATH, index=False)
-    print(f"\n✅ Test predictions and labels saved to {Config.RESULTS_SAVE_PATH}")
+    print("\n--- FINAL MCNN PERFORMANCE (Standard Binary Metrics) ---")
+    print("Metrics are calculated for the positive class (label=1)")
+    print("="*55)
+    print(f"Accuracy:  {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1-score:  {f1:.4f}")
+    print("="*55)
