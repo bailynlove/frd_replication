@@ -4,7 +4,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertModel
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
 import numpy as np
 
@@ -160,9 +160,11 @@ def eval_model(model, data_loader, loss_fn, device, n_examples):
 
     # 计算评估指标
     accuracy = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='macro') # 使用 'macro' F1-score更关注少数类的表现
+    precision = precision_score(all_labels, all_preds, average='binary', zero_division=0)
+    recall = recall_score(all_labels, all_preds, average='binary', zero_division=0)
+    f1 = f1_score(all_labels, all_preds)
 
-    return accuracy, f1, np.mean(losses)
+    return accuracy, precision, recall, f1, np.mean(losses)
 
 # --- 主执行流程 ---
 if __name__ == '__main__':
@@ -278,7 +280,7 @@ if __name__ == '__main__':
     # 加载表现最好的模型权重
     model.load_state_dict(torch.load('best_model_state.bin'))
     
-    test_acc, test_f1, _ = eval_model(
+    test_acc, test_pre, test_rec, test_f1, _ = eval_model(
         model,
         test_data_loader,
         loss_fn,
@@ -288,5 +290,7 @@ if __name__ == '__main__':
     
     print("\n--- Final Baseline Results ---")
     print(f"Test Accuracy: {test_acc:.4f}")
-    print(f"Test F1-score (Macro): {test_f1:.4f}")
+    print(f"Test Pre: {test_pre:.4f}")
+    print(f"Test Rec: {test_rec:.4f}")
+    print(f"Test F1-score: {test_f1:.4f}")
     print("--------------------------------")

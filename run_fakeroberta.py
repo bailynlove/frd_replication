@@ -118,4 +118,5 @@ if __name__ == '__main__':
     print(f"Test F1-score (Macro): {test_results['eval_f1']:.4f}")
     print(f"Test Precision (Macro): {test_results['eval_precision']:.4f}")
     print(f"Test Recall (Macro): {test_results['eval_recall']:.4f}")
+    print(test_results)
     print("-------------------------------------------------")

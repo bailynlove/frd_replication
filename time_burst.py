@@ -19,7 +19,7 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report, precision_score, recall_score
 from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
 from imblearn.over_sampling import SMOTE
 
@@ -165,8 +165,10 @@ def train_and_evaluate(X, y):
     cm = confusion_matrix(y_test, y_pred)
     print(cm)
     accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, average='binary', zero_division=0)
+    recall = recall_score(y_test, y_pred, average='binary', zero_division=0)
     f1 = f1_score(y_test, y_pred)
-    print(f"acc: {accuracy}, f1: {f1}")
+    print(f"acc: {accuracy}, pre: {precision}, rec: {recall}, f1: {f1}")
 
 
 # --- 主函数执行流程 ---
