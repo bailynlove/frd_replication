@@ -78,7 +78,7 @@ class MultimodalDataset(Dataset):
         attention_mask = encoding['attention_mask'].squeeze()
 
         # Load image (use first photo_id if multiple)
-        photo_ids_str = str(row.get('photo_ids', ''))
+        photo_ids_str = str(row.get('photo_ids', '')) if not pd.isna(row.get('photo_ids')) else ''
         photo_id = photo_ids_str.split('#')[0] if photo_ids_str else None
         image_tensor_spatial = torch.zeros(3, 224, 224) # Default if no image
         image_tensor_freq = torch.zeros(1, 299, 299) # Default if no image (DCT often single channel)
