@@ -81,7 +81,7 @@ class MultimodalDataset(Dataset):
         photo_ids_str = str(row.get('photo_ids', '')) if not pd.isna(row.get('photo_ids')) else ''
         photo_id = photo_ids_str.split('#')[0] if photo_ids_str else None
         image_tensor_spatial = torch.zeros(3, 224, 224) # Default if no image
-        image_tensor_freq = torch.zeros(1, 299, 299) # Default if no image (DCT often single channel)
+        image_tensor_freq = torch.zeros(3, 299, 299) # Default if no image (DCT often single channel)
 
         if photo_id:
             img_path = os.path.join(self.image_dir, f"{photo_id}.jpg")
@@ -93,7 +93,8 @@ class MultimodalDataset(Dataset):
                 # Apply DCT (assuming grayscale DCT, take one channel or convert)
                 # This is a simplified approach, might need refinement
                 # Apply DCT to one channel or grayscale version
-                image_tensor_freq = apply_dct_transform(image_tensor_freq_raw) # [1, 299, 299]
+                image_tensor_freq_dct_single = apply_dct_transform(image_tensor_freq_raw) # [1, 299, 299]
+                image_tensor_freq = image_tensor_freq_dct_single.repeat(3, 1, 1)  # [3, H, W]
                 # If you want to use the full 3-channel DCT processed image, adjust accordingly
                 # Or, if InceptionV3 is supposed to process the DCT image directly, just use inception_transform
                 # For now, let's assume apply_dct_transform gives the correct format for InceptionV3 freq encoder
