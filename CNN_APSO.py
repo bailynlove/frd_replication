@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore')
 
 # --- 1. 全局配置 ---
 class Config:
-    CSV_PATH = '../../spams_detection/datasets/crawler/LA/outputs/full_data_0617.csv'
+    CSV_PATH = '../spams_dataset/LA/outputs/full_data_0731_aug_4.csv'
     TEXT_COLUMN = 'content'
     LABEL_COLUMN = 'is_recommended'
     POSITIVE_CLASS_LABEL = 1
