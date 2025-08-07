@@ -10,8 +10,8 @@ from sr_cibn_model import SR_CIBN, InfoNCELoss # Import your model and loss
 from data_loader import MultimodalDataset # Import your data loader
 
 # --- Configuration ---
-DATA_CSV_PATH = '../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv'
-IMAGE_DIR = '../spams_detection/spam_datasets/crawler/LA/images/'
+DATA_CSV_PATH = '../../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv'
+IMAGE_DIR = '../../spams_detection/spam_datasets/crawler/LA/images/'
 MODEL_SAVE_PATH = 'sr_cibn_model.pth'
 BATCH_SIZE = 128 # As per paper
 LEARNING_RATE = 0.001 # As per paper

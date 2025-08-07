@@ -59,9 +59,8 @@ class MultimodalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         text = str(row['content']) # Assuming 'content' is your text column
-        # Assuming you have a 'label' column (0 or 1). If not, define it.
         try:
-            label = int(row['label'])
+            label = int(row['is_recommended'])
         except KeyError:
             # Example: Define label based on rating or is_recommended
             # Adjust this logic based on your data definition of fake/real
