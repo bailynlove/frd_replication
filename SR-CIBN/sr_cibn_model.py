@@ -129,7 +129,7 @@ class SR_CIBN(nn.Module):
         # Cosine similarity and fusion logic are handled in forward pass
 
         # --- 5. Classifier ---
-        self.classifier = nn.Linear(feature_dim * 2, num_classes) # Concatenated GI and GM
+        self.classifier = nn.Linear(feature_dim, num_classes) # Concatenated GI and GM
 
         # --- 6. Loss Components (Defined outside for flexibility) ---
         # Contrastive Loss, Triplet Loss will be calculated separately
