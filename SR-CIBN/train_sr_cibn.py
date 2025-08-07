@@ -1,6 +1,7 @@
 # train_sr_cibn.py
 
 import torch
+import argparse
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -13,7 +14,6 @@ from data_loader import MultimodalDataset # Import your data loader
 DATA_CSV_PATH = '../../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv'
 IMAGE_DIR = '../../spams_detection/spam_datasets/crawler/LA/images/'
 MODEL_SAVE_PATH = 'sr_cibn_model.pth'
-BATCH_SIZE = 128 # As per paper
 LEARNING_RATE = 0.001 # As per paper
 NUM_EPOCHS = 120 # As per paper
 FEATURE_DIM = 256 # As per paper
@@ -24,6 +24,11 @@ LAMBDA2 = 0.5 # Weight for triplet loss (placeholder)
 MARGIN_GAMMA = 0.5 # For triplet loss
 THRESHOLD_TAU = 0.4 # For triplet loss clustering
 SPARSITY_RATE_RHO = 0.6 # For patch selection
+
+parser = argparse.ArgumentParser(description='Train SR-CIBN Model')
+parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+args = parser.parse_args()
+BATCH_SIZE = args.batch_size
 
 # --- Device ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

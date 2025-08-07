@@ -102,7 +102,7 @@ class MultimodalDataset(Dataset):
                  # image_tensor_freq = image_tensor_freq_raw # If InceptionV3 handles it
 
             except FileNotFoundError:
-                print(f"Warning: Image not found at {img_path}. Using zero tensor.")
+                print(f"Warning: Image not found at {row['review_id']}:{photo_ids_str}. Using zero tensor.")
             except Exception as e:
                 print(f"Error loading image {img_path}: {e}. Using zero tensor.")
 
