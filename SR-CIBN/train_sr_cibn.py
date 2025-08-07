@@ -1,5 +1,4 @@
 # train_sr_cibn.py
-
 import torch
 import argparse
 import torch.nn as nn
@@ -7,6 +6,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+# --- Import logging and tqdm ---
+import logging
+from tqdm import tqdm
+import sys # For flushing stdout if needed
+# --------------------------------
+
 from sr_cibn_model import SR_CIBN, InfoNCELoss # Import your model and loss
 from data_loader import MultimodalDataset # Import your data loader
 
@@ -30,11 +35,36 @@ parser.add_argument('--batch_size', type=int, default=16, help='Batch size for t
 args = parser.parse_args()
 BATCH_SIZE = args.batch_size
 
+# --- Logging Configuration ---
+# Create a custom logger
+logger = logging.getLogger('SR_CIBN_Trainer')
+logger.setLevel(logging.DEBUG) # Set to DEBUG to capture all levels
+
+# Create handlers
+console_handler = logging.StreamHandler(sys.stdout) # Log to console
+console_handler.setLevel(logging.INFO) # Console shows INFO and above
+
+# Create formatters and add them to handlers
+# Formatter for console (simpler)
+c_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+console_handler.setFormatter(c_format)
+
+# Add handlers to the logger
+logger.addHandler(console_handler)
+# You can add a file handler here if you want to log to a file as well
+# file_handler = logging.FileHandler('training.log')
+# file_handler.setLevel(logging.DEBUG)
+# f_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# file_handler.setFormatter(f_format)
+# logger.addHandler(file_handler)
+# -----------------------------
+
 # --- Device ---
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+logger.info(f"Using device: {device}")
 
 # --- Data Loading ---
+logger.info("Loading dataset...")
 full_dataset = MultimodalDataset(DATA_CSV_PATH, IMAGE_DIR)
 # Split dataset (adjust split sizes as needed)
 train_size = int(0.8 * len(full_dataset))
@@ -43,8 +73,10 @@ train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False) # Usually no shuffle for val
+logger.info(f"Dataset loaded. Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
 
 # --- Model, Loss, Optimizer ---
+logger.info("Initializing model...")
 model = SR_CIBN(feature_dim=FEATURE_DIM, num_heads=NUM_HEADS, num_classes=2)
 model.to(device)
 
@@ -56,11 +88,18 @@ criterion_con = InfoNCELoss(temperature=TEMPERATURE)
 
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 # Consider learning rate scheduler if needed
+logger.info("Model, loss functions, and optimizer initialized.")
 
 # --- Metrics Calculation ---
 def calculate_metrics(y_true, y_pred):
     acc = accuracy_score(y_true, y_pred)
-    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+    # Handle potential division by zero or undefined metrics
+    try:
+        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+    except ValueError:
+        # If only one class present in y_true or y_pred
+        logger.warning("Only one class present in batch predictions/labels, setting prec/rec/f1 to 0.")
+        prec, rec, f1 = 0.0, 0.0, 0.0
     return acc, prec, rec, f1
 
 # --- Training Function (Single Epoch) ---
@@ -74,7 +113,10 @@ def train_epoch(model, dataloader, optimizer, criterion_cls, criterion_con, devi
     all_labels = []
     num_batches = len(dataloader)
 
-    for batch_idx, batch in enumerate(dataloader):
+    # Wrap the dataloader with tqdm for progress bar
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]", leave=False)
+
+    for batch_idx, batch in enumerate(progress_bar):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         image_tensor_spatial = batch['image_tensor_spatial'].to(device)
@@ -179,11 +221,14 @@ def train_epoch(model, dataloader, optimizer, criterion_cls, criterion_con, devi
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
-        # Print progress (optional)
-        if batch_idx % 10 == 0:
-             print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Step [{batch_idx+1}/{num_batches}], "
-                   f"Loss: {total_batch_loss.item():.4f}, CLS: {cls_loss.item():.4f}, "
-                   f"CON: {con_loss.item():.4f}, TPL: {triplet_loss.item():.4f}")
+        # Update tqdm progress bar description with current batch loss
+        # Optional: show more metrics if desired, but can slow down slightly
+        progress_bar.set_postfix({
+            'Loss': f"{total_batch_loss.item():.4f}",
+            'CLS': f"{cls_loss.item():.4f}",
+            'CON': f"{con_loss.item():.4f}",
+            'TPL': f"{triplet_loss.item():.4f}"
+        })
 
     # Calculate metrics for the epoch
     train_acc, train_prec, train_rec, train_f1 = calculate_metrics(all_labels, all_preds)
@@ -192,21 +237,25 @@ def train_epoch(model, dataloader, optimizer, criterion_cls, criterion_con, devi
     avg_con_loss = total_con_loss / num_batches
     avg_triplet_loss = total_triplet_loss / num_batches # Might be 0 if triplet not computed
 
-    print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] Training Metrics - "
-          f"Loss: {avg_loss:.4f}, Acc: {train_acc:.4f}, Prec: {train_prec:.4f}, "
-          f"Rec: {train_rec:.4f}, F1: {train_f1:.4f}")
+    # Log epoch summary using logger
+    logger.info(f"Epoch [{epoch+1}/{NUM_EPOCHS}] Training Metrics - "
+                f"Avg Loss: {avg_loss:.4f}, Acc: {train_acc:.4f}, Prec: {train_prec:.4f}, "
+                f"Rec: {train_rec:.4f}, F1: {train_f1:.4f}")
     return avg_loss, train_acc, train_prec, train_rec, train_f1
 
 # --- Validation Function ---
-def validate_epoch(model, dataloader, criterion_cls, device):
+def validate_epoch(model, dataloader, criterion_cls, device, epoch):
     model.eval()
     total_loss = 0
     all_preds = []
     all_labels = []
     num_batches = len(dataloader)
 
+    # Wrap the dataloader with tqdm for progress bar
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]", leave=False)
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in progress_bar:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             image_tensor_spatial = batch['image_tensor_spatial'].to(device)
@@ -223,32 +272,43 @@ def validate_epoch(model, dataloader, criterion_cls, device):
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
+            # Optional: Update progress bar with val loss (less critical)
+            # progress_bar.set_postfix({'Val_Loss': f"{loss.item():.4f}"})
+
     val_loss = total_loss / num_batches
     val_acc, val_prec, val_rec, val_f1 = calculate_metrics(all_labels, all_preds)
-    print(f"Validation Metrics - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, "
-          f"Prec: {val_prec:.4f}, Rec: {val_rec:.4f}, F1: {val_f1:.4f}")
+
+    # Log validation summary using logger
+    logger.info(f"Epoch [{epoch+1}/{NUM_EPOCHS}] Validation Metrics - "
+                f"Avg Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, Prec: {val_prec:.4f}, "
+                f"Rec: {val_rec:.4f}, F1: {val_f1:.4f}")
     return val_loss, val_acc, val_prec, val_rec, val_f1
 
 # --- Main Training Loop ---
+logger.info("Starting training loop...")
 best_val_f1 = 0.0
 for epoch in range(NUM_EPOCHS):
+    # Train
     train_loss, train_acc, train_prec, train_rec, train_f1 = train_epoch(
         model, train_loader, optimizer, criterion_cls, criterion_con, device,
         epoch, LAMBDA1, LAMBDA2, MARGIN_GAMMA, THRESHOLD_TAU
     )
-    val_loss, val_acc, val_prec, val_rec, val_f1 = validate_epoch(model, val_loader, criterion_cls, device)
+    # Validate
+    val_loss, val_acc, val_prec, val_rec, val_f1 = validate_epoch(model, val_loader, criterion_cls, device, epoch)
 
     # Save best model
     if val_f1 > best_val_f1:
         best_val_f1 = val_f1
         torch.save(model.state_dict(), MODEL_SAVE_PATH)
-        print(f"New best model saved with F1: {best_val_f1:.4f}")
+        logger.info(f"New best model saved with F1: {best_val_f1:.4f} (Epoch {epoch+1})")
 
-print("Training finished.")
+logger.info("Training finished.")
+logger.info(f"Best validation F1 score: {best_val_f1:.4f}")
 
 # --- Final Evaluation on Test Set (Optional) ---
 # You would load the best model and run it on a held-out test set
+# logger.info("Loading best model for final test evaluation...")
 # model.load_state_dict(torch.load(MODEL_SAVE_PATH))
-# test_loss, test_acc, test_prec, test_rec, test_f1 = validate_epoch(model, test_loader, criterion_cls, device)
-# print(f"Final Test Metrics - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, "
-#       f"Prec: {test_prec:.4f}, Rec: {test_rec:.4f}, F1: {test_f1:.4f}")
+# test_loss, test_acc, test_prec, test_rec, test_f1 = validate_epoch(model, test_loader, criterion_cls, device, epoch="Final_Test")
+# logger.info(f"Final Test Metrics - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}, "
+#             f"Prec: {test_prec:.4f}, Rec: {test_rec:.4f}, F1: {test_f1:.4f}")
