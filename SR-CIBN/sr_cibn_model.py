@@ -173,7 +173,7 @@ class SR_CIBN(nn.Module):
             raise e
 
         # 现在 image_outputs_freq 应该是 [B, 2048] 的张量
-        uf_global = image_outputs_freq
+        uf_global = self.image_projector_freq(image_outputs_freq)
         uf = uf_global.unsqueeze(1).expand(-1, uv.shape[1], -1) # [B, Nv, D] (broadcast to patch size)
         uf = self.ln_image_freq(uf)
 
