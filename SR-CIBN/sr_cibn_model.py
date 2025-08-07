@@ -7,6 +7,7 @@ import numpy as np
 from transformers import BertModel, ViTModel, ViTConfig
 import torchvision.models as models
 from torchvision import transforms
+from torchvision.models import Inception_V3_Weights
 import math
 
 # --- Helper Modules ---
@@ -87,7 +88,13 @@ class SR_CIBN(nn.Module):
         # Note: You need to implement DCT transformation in the data loading part
         # This assumes input is already DCT transformed or InceptionV3 handles it implicitly
         # For simplicity, using standard InceptionV3, assuming DCT preprocessing happens elsewhere
-        self.image_encoder_freq = models.inception_v3(pretrained=True, transform_input=False)
+        # self.image_encoder_freq = models.inception_v3(pretrained=True, transform_input=False)
+        weights = Inception_V3_Weights.IMAGENET1K_V1  # 或 Inception_V3_Weights.DEFAULT
+        self.image_encoder_freq = models.inception_v3(weights=weights)  # 使用 weights 参数
+        if self.image_encoder_freq.aux_logits:
+            self.image_encoder_freq.aux_logits = False
+            # 注意：直接设置为 False 可能不完全移除 AuxLogits 层，更安全的做法是重新定义 forward 或者确保 AuxLogits 不会干扰主输出
+            # 但通常设置 aux_logits=False 并将 fc 设为 Identity 是有效的
         # Modify final layer to output features instead of classification
         self.image_encoder_freq.fc = nn.Identity() # Remove final classification layer
         self.image_dim_freq = 2048 # Standard output dim for InceptionV3 features
@@ -145,9 +152,28 @@ class SR_CIBN(nn.Module):
 
         # Image Frequency (InceptionV3 - assumes DCT preprocessing done)
         # Ensure image_tensor_freq is preprocessed correctly for InceptionV3
-        image_outputs_freq = self.image_encoder_freq(image_tensor_freq)
-        uf_global = self.image_projector_freq(image_outputs_freq) # [B, D]
+        # image_outputs_freq = self.image_encoder_freq(image_tensor_freq)
+        # uf_global = self.image_projector_freq(image_outputs_freq) # [B, D]
         # For simplicity, treating frequency as a single global feature vector
+        try:
+            image_outputs_freq_raw = self.image_encoder_freq(image_tensor_freq)
+            # 检查输出类型
+            if isinstance(image_outputs_freq_raw, models.inception.InceptionOutputs):
+                # 如果仍然返回 InceptionOutputs，取 logits 部分
+                # 注意：如果 fc 是 Identity，logits 应该就是特征
+                # 但有时结构可能保留，需要明确取出
+                image_outputs_freq = image_outputs_freq_raw.logits
+            else:
+                # 如果已经正确修改为返回特征张量
+                image_outputs_freq = image_outputs_freq_raw
+        except Exception as e:
+            print(f"Error during InceptionV3 forward pass: {e}")
+            print(f"Input shape: {image_tensor_freq.shape}")
+            print(f"Model fc layer: {self.image_encoder_freq.fc}")
+            raise e
+
+        # 现在 image_outputs_freq 应该是 [B, 2048] 的张量
+        uf_global = image_outputs_freq
         uf = uf_global.unsqueeze(1).expand(-1, uv.shape[1], -1) # [B, Nv, D] (broadcast to patch size)
         uf = self.ln_image_freq(uf)
 
