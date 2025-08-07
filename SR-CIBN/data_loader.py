@@ -45,7 +45,7 @@ def apply_dct_transform(image_tensor):
     return dct_tensor
 
 class MultimodalDataset(Dataset):
-    def __init__(self, csv_file, image_dir, tokenizer_name='bert-base-chinese', max_length=128):
+    def __init__(self, csv_file, image_dir, tokenizer_name='bert-base', max_length=128):
         self.df = pd.read_csv(csv_file)
         self.image_dir = image_dir
         self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)

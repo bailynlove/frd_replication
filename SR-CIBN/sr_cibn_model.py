@@ -73,7 +73,7 @@ class SR_CIBN(nn.Module):
 
         # --- 1. Unimodal Feature Extraction ---
         # Text Encoder
-        self.text_encoder = BertModel.from_pretrained('bert-base-chinese')
+        self.text_encoder = BertModel.from_pretrained('bert-base')
         self.text_dim = self.text_encoder.config.hidden_size
         self.text_projector = nn.Linear(self.text_dim, feature_dim)
 
