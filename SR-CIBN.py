@@ -8,6 +8,7 @@ from transformers import BertModel, BertTokenizer, ViTModel, ViTImageProcessor
 from torch.optim import AdamW
 from PIL import Image
 import pandas as pd
+import argparse
 import numpy as np
 from scipy.fft import dct
 from tqdm import tqdm
@@ -17,13 +18,18 @@ import warnings
 # Suppress warnings from transformers and other libraries
 warnings.filterwarnings("ignore")
 
+parser = argparse.ArgumentParser(description='Train SR-CIBN Model')
+parser.add_argument('--batch_size', '-bs', type=int, default=16, help='Batch size for training')
+args = parser.parse_args()
+BATCH_SIZE = args.batch_size
+
 # --- 1. Configuration ---
 CONFIG = {
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "image_dir": "../spams_detection/spam_datasets/crawler/LA/images/",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "epochs": 20,  # The paper uses 120, but 20 is a good start for testing
-    "batch_size": 16,  # The paper uses 128, adjust based on your GPU VRAM
+    "batch_size": BATCH_SIZE,  # The paper uses 128, adjust based on your GPU VRAM
     "learning_rate": 1e-4,  # Paper uses 1e-3, but 1e-4 is often safer for transformers
     "embedding_dim": 256,  # d in the paper
     "attention_heads": 8,  # N_h in the paper
