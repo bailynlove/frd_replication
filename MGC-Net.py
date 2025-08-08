@@ -45,7 +45,7 @@ print(f"Using device: {CONFIG['device']}")
 # --- 2. Helper Modules ---
 
 class GATLayer(nn.Module):
-    """A single Graph Attention Network (GAT) layer."""
+    """A single Graph Attention Network (GAT) layer (corrected and simplified)."""
 
     def __init__(self, in_features, out_features, n_heads, alpha=0.2):
         super().__init__()
@@ -53,34 +53,39 @@ class GATLayer(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        self.W = nn.Parameter(torch.zeros(size=(in_features, out_features * n_heads)))
-        nn.init.xavier_uniform_(self.W.data, gain=1.414)
-        self.a = nn.Parameter(torch.zeros(size=(2 * out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+        # This single linear layer is more efficient
+        self.W = nn.Linear(in_features, out_features * n_heads, bias=False)
+        # Attention mechanism
+        self.a = nn.Parameter(torch.randn(size=(1, n_heads, 2 * out_features)))
 
         self.leakyrelu = nn.LeakyReLU(alpha)
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, h, adj):
         # h: (N, in_features), adj: (N, N)
-        Wh = torch.mm(h, self.W)  # (N, out_features * n_heads)
-        Wh = Wh.view(-1, self.n_heads, self.out_features)  # (N, n_heads, out_features)
+        N = h.size(0)
 
-        a_input = self._prepare_attentional_mechanism_input(Wh)  # (N, N, 2*out_features)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))  # (N, N, n_heads)
+        # 1. Apply linear transformation
+        Wh = self.W(h).view(N, self.n_heads, self.out_features)  # (N, n_heads, out_features)
 
+        # 2. Prepare for attention score calculation
+        Wh_i = Wh.unsqueeze(1).expand(N, N, self.n_heads, self.out_features)
+        Wh_j = Wh.unsqueeze(0).expand(N, N, self.n_heads, self.out_features)
+        a_input = torch.cat([Wh_i, Wh_j], dim=-1)  # (N, N, n_heads, 2*out_features)
+
+        # 3. Calculate attention scores
+        e = self.leakyrelu((a_input * self.a).sum(dim=-1))  # (N, N, n_heads)
+
+        # 4. Mask with adjacency matrix
         zero_vec = -9e15 * torch.ones_like(e)
-        attention = torch.where(adj > 0, e, zero_vec)
-        attention = F.softmax(attention, dim=1)
+        attention = torch.where(adj.unsqueeze(-1) > 0, e, zero_vec)  # Use unsqueeze to broadcast adj
+        attention = self.softmax(attention)
 
-        h_prime = torch.matmul(attention, Wh)  # (N, n_heads, out_features)
-        return F.elu(h_prime.view(-1, self.n_heads * self.out_features))
+        # 5. Apply attention to get new features
+        h_prime = torch.einsum('ijh,jhd->ihd', attention, Wh)  # (N, n_heads, out_features)
 
-    def _prepare_attentional_mechanism_input(self, Wh):
-        N = Wh.size()[0]
-        Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=0)
-        Wh_repeated_alternating = Wh.repeat(N, 1)
-        all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=1)
-        return all_combinations_matrix.view(N, N, self.n_heads, 2 * self.out_features)
+        # Concatenate heads and apply final activation
+        return F.elu(h_prime.reshape(N, self.n_heads * self.out_features))
 
 
 # --- 3. The Main Model ---
