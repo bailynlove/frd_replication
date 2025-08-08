@@ -16,31 +16,39 @@ import argparse
 from torch_geometric.nn import GATConv
 from torch_geometric.data import Data, Batch
 from collections import defaultdict
+from torch.cuda.amp import GradScaler, autocast
 
 warnings.filterwarnings("ignore")
 
-parser = argparse.ArgumentParser(description='Train CR-FND Model')
-parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training.')
+# --- 命令行参数设置 ---
+parser = argparse.ArgumentParser(description='Train CR-FND Model with Optimizations')
+parser.add_argument('--batch_size', type=int, default=8, help='Actual batch size per forward pass.')
+parser.add_argument('--accumulation_steps', type=int, default=4, help='Number of steps to accumulate gradients.')
 args = parser.parse_args()
 
+# --- 配置 ---
 CONFIG = {
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "image_dir": "../spams_detection/spam_datasets/crawler/LA/images/",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "epochs": 3,
-    "learning_rate": 1e-5,
+    "epochs": 20,
+    "learning_rate": 5e-5,
     "bert_model": "bert-base-uncased",
     "vit_model": "google/vit-base-patch16-224-in21k",
     "clip_model": "openai/clip-vit-base-patch32",
     "hidden_dim": 256,
     "num_classes": 2,
-    "best_model_path": "cr_fnd_best_model_v3.pth",
+    "best_model_path": "cr_fnd_best_model_v4.pth",
     "grad_clip_value": 1.0
 }
 
+effective_batch_size = args.batch_size * args.accumulation_steps
 print(f"使用设备: {CONFIG['device']}")
+print(
+    f"实际Batch Size: {args.batch_size}, 梯度累积步数: {args.accumulation_steps}, 等效Batch Size: {effective_batch_size}")
 
 
+# --- 模型子模块 ---
 class VAE(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim):
         super().__init__()
@@ -192,7 +200,6 @@ class SpamPropagationDataset(Dataset):
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous() if edge_list else torch.empty((2, 0),
                                                                                                               dtype=torch.long)
 
-        # --- 修正点: 将节点输入作为独立属性 ---
         node_texts = [f"user: {name}" for name, idx in self.user_map.items() if idx in subgraph_nodes] + \
                      [f"business: {name}" for name, idx in self.biz_map.items() if
                       idx + len(self.user_map) in subgraph_nodes]
@@ -253,65 +260,111 @@ if __name__ == '__main__':
         }
 
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn,
+                              num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, num_workers=2)
 
     model = CRFND(CONFIG, vocab_size=tokenizer.vocab_size).to(CONFIG["device"])
     optimizer = AdamW(model.parameters(), lr=CONFIG["learning_rate"])
+    scaler = GradScaler()
 
     best_val_acc = 0.0
     for epoch in range(CONFIG["epochs"]):
         model.train()
         total_loss, total_correct = 0, 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1} Training"):
-            optimizer.zero_grad()
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1} Training")
 
-            # --- 修正点: 正确处理 graph_batch ---
-            graph_batch = batch['graph_batch'].to(CONFIG['device'])
-            with torch.no_grad():
-                node_features = model.bert(
-                    input_ids=graph_batch.input_ids,
-                    attention_mask=graph_batch.attention_mask
-                ).last_hidden_state.mean(dim=1)
-            graph_batch.x = node_features
+        for i, batch in enumerate(progress_bar):
+            with autocast():
+                graph_batch = batch['graph_batch'].to(CONFIG['device'])
+                with torch.no_grad():
+                    node_features = model.bert(
+                        input_ids=graph_batch.input_ids,
+                        attention_mask=graph_batch.attention_mask
+                    ).last_hidden_state.mean(dim=1)
+                graph_batch.x = node_features
 
-            logits, mns_feat, graph_feat = model(
-                bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
-                bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
-                clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
-                clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
-                images=batch['images'].to(CONFIG["device"]),
-                bow_vector=batch['bow_vector'].to(CONFIG["device"]),
-                graph_batch=graph_batch
-            )
+                logits, mns_feat, graph_feat = model(
+                    bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
+                    bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
+                    clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
+                    clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
+                    images=batch['images'].to(CONFIG["device"]),
+                    bow_vector=batch['bow_vector'].to(CONFIG["device"]),
+                    graph_batch=graph_batch
+                )
 
-            labels = batch['labels'].to(CONFIG["device"])
-            positive_mask = (labels == 1)
-            loss_cl = 0.0
-            if positive_mask.sum() > 1:
-                pos_mns, pos_graph = mns_feat[positive_mask], graph_feat[positive_mask]
-                sim_matrix = F.cosine_similarity(pos_mns.unsqueeze(1), pos_graph.unsqueeze(0), dim=2)
-                loss_cl = F.cross_entropy(sim_matrix, torch.arange(len(pos_mns), device=CONFIG["device"]))
+                labels = batch['labels'].to(CONFIG["device"])
+                positive_mask = (labels == 1)
+                loss_cl = 0.0
+                if positive_mask.sum() > 1:
+                    pos_mns, pos_graph = mns_feat[positive_mask], graph_feat[positive_mask]
+                    sim_matrix = F.cosine_similarity(pos_mns.unsqueeze(1), pos_graph.unsqueeze(0), dim=2)
+                    loss_cl = F.cross_entropy(sim_matrix, torch.arange(len(pos_mns), device=CONFIG["device"]))
 
-            loss_ce = F.cross_entropy(logits, labels)
-            loss = loss_ce + 0.1 * loss_cl
+                loss_ce = F.cross_entropy(logits, labels)
+                loss = loss_ce + 0.1 * loss_cl
+                loss = loss / args.accumulation_steps
 
             if not torch.isnan(loss):
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip_value"])
-                optimizer.step()
-                total_loss += loss.item()
+                scaler.scale(loss).backward()
+                total_loss += loss.item() * args.accumulation_steps
 
             total_correct += (logits.argmax(1) == labels).sum().item()
 
+            if (i + 1) % args.accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip_value"])
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            progress_bar.set_postfix(loss=loss.item() * args.accumulation_steps)
+
+        torch.cuda.empty_cache()
+
         train_acc = total_correct / len(train_dataset)
-        train_loss = total_loss / len(train_loader)
+        train_loss = total_loss / (len(train_loader) / args.accumulation_steps)
 
         model.eval()
         val_correct = 0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch + 1} Validation"):
+                with autocast():
+                    graph_batch = batch['graph_batch'].to(CONFIG['device'])
+                    with torch.no_grad():
+                        node_features = model.bert(
+                            input_ids=graph_batch.input_ids,
+                            attention_mask=graph_batch.attention_mask
+                        ).last_hidden_state.mean(dim=1)
+                    graph_batch.x = node_features
+
+                    logits, _, _ = model(
+                        bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
+                        bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
+                        clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
+                        clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
+                        images=batch['images'].to(CONFIG["device"]),
+                        bow_vector=batch['bow_vector'].to(CONFIG["device"]),
+                        graph_batch=graph_batch
+                    )
+                val_correct += (logits.argmax(1) == batch['labels'].to(CONFIG["device"])).sum().item()
+
+        val_acc = val_correct / len(val_dataset)
+        print(f"Epoch {epoch + 1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f} | Val Acc={val_acc:.4f}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), CONFIG["best_model_path"])
+
+    print("\nTesting...")
+    model.load_state_dict(torch.load(CONFIG["best_model_path"]))
+    model.eval()
+    all_labels, all_preds = [], []
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Testing"):
+            with autocast():
                 graph_batch = batch['graph_batch'].to(CONFIG['device'])
                 with torch.no_grad():
                     node_features = model.bert(
@@ -329,37 +382,6 @@ if __name__ == '__main__':
                     bow_vector=batch['bow_vector'].to(CONFIG["device"]),
                     graph_batch=graph_batch
                 )
-                val_correct += (logits.argmax(1) == batch['labels'].to(CONFIG["device"])).sum().item()
-        val_acc = val_correct / len(val_dataset)
-        print(f"Epoch {epoch + 1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f} | Val Acc={val_acc:.4f}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), CONFIG["best_model_path"])
-
-    print("\nTesting...")
-    model.load_state_dict(torch.load(CONFIG["best_model_path"]))
-    model.eval()
-    all_labels, all_preds = [], []
-    with torch.no_grad():
-        for batch in test_loader:
-            graph_batch = batch['graph_batch'].to(CONFIG['device'])
-            with torch.no_grad():
-                node_features = model.bert(
-                    input_ids=graph_batch.input_ids,
-                    attention_mask=graph_batch.attention_mask
-                ).last_hidden_state.mean(dim=1)
-            graph_batch.x = node_features
-
-            logits, _, _ = model(
-                bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
-                bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
-                clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
-                clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
-                images=batch['images'].to(CONFIG["device"]),
-                bow_vector=batch['bow_vector'].to(CONFIG["device"]),
-                graph_batch=graph_batch
-            )
             all_preds.extend(logits.argmax(1).cpu().numpy())
             all_labels.extend(batch['labels'].numpy())
 
