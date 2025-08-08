@@ -4,7 +4,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.models import inception_v3, Inception_V3_Weights
-from transformers import BertModel, BertTokenizer, ViTModel, ViTImageProcessor, AdamW
+from transformers import BertModel, BertTokenizer, ViTModel, ViTImageProcessor
+from torch.optim import AdamW
 from PIL import Image
 import pandas as pd
 import numpy as np
