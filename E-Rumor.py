@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertModel, BertTokenizer, AdamW
+from transformers import BertModel, BertTokenizer
+from torch.optim import AdamW
 from torch.distributions.multivariate_normal import MultivariateNormal
 import pandas as pd
 import numpy as np
