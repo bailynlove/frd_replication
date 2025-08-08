@@ -30,13 +30,14 @@ CONFIG = {
     "epochs": 10,
     "batch_size": BATCH_SIZE,  # Reduced batch size due to high memory usage of GATs and multiple models
     "learning_rate": 1e-4,
-    "embedding_dim": 768,  # Using BERT-base's default for simplicity
-    "attention_heads": 8,
+    "embedding_dim": 768,
+    "attention_heads": 4,
+    "gat_out_features": 128,
     "bert_model": "bert-base-uncased",
     "vit_model": "google/vit-base-patch16-224-in21k",
     "clip_model": "openai/clip-vit-base-patch32",
     "spacy_model": "en_core_web_sm",
-    "best_model_path": "multi_granularity_best_model.pth"
+    "best_model_path": "mgc_net_best_model.pth"
 }
 
 print(f"Using device: {CONFIG['device']}")
