@@ -138,37 +138,39 @@ class SR_CIBN(nn.Module):
         # The paper concatenates G_I/G_M with O_tvf, so input is 2*embed_dim
         self.classifier = nn.Linear(2 * self.embed_dim, 2)  # 2 classes: real (1), fake (0)
 
-    def _extract_unimodal_features(self, text_input, image_input):
-        # Text features
-        text_outputs = self.bert(**text_input)
-        text_feat = text_outputs.last_hidden_state[:, 0, :]
-        u_t = self.text_proj(text_feat)
+    def _extract_consistency_inconsistency(self, u_t, u_v_patches, O_tvf):
+        u_t_expanded = u_t.unsqueeze(1).expand_as(u_v_patches)
 
-        # Image Spatial features (from ViT)
-        vit_outputs = self.vit(image_input)
-        image_patches = vit_outputs.last_hidden_state[:, 1:, :]
-        image_global = vit_outputs.last_hidden_state[:, 0, :]
-        u_v_patches = self.vit_proj(image_patches)
-        u_v_global = self.vit_proj(image_global)
+        cross_attention_scores = torch.sum(u_v_patches * u_t_expanded, dim=-1)
+        self_attention_scores = torch.sum(u_v_patches * u_v_patches.mean(dim=1, keepdim=True), dim=-1)
 
-        # Image Frequency features (DCT + Inception)
-        inception_input = F.interpolate(image_input, size=(299, 299), mode='bilinear', align_corners=False)
-        dct_image = self.dct(inception_input)
-        if dct_image.shape[1] == 1:
-            dct_image = dct_image.repeat(1, 3, 1, 1)
+        a_M = F.softmax(cross_attention_scores, dim=-1) + F.softmax(self_attention_scores, dim=-1)
+        a_I = F.softmax(-cross_attention_scores, dim=-1) + F.softmax(self_attention_scores, dim=-1)
+
+        num_patches = u_v_patches.shape[1]
+        num_select = int(self.config["sparsity_rate"] * num_patches)
+
+        _, top_M_indices = torch.topk(a_M, k=num_select, dim=1)
+        _, top_I_indices = torch.topk(a_I, k=num_select, dim=1)
+
+        V_M = torch.gather(u_v_patches, 1, top_M_indices.unsqueeze(-1).expand(-1, -1, self.embed_dim))
+        V_I = torch.gather(u_v_patches, 1, top_I_indices.unsqueeze(-1).expand(-1, -1, self.embed_dim))
+
+        V_M_enhanced = V_M + self.patch_enhancer(V_M)
+        V_I_enhanced = V_I + self.patch_enhancer(V_I)
+
+        O_tvf_expanded = O_tvf.unsqueeze(1)
 
         # --- START OF FIX ---
-        inception_output = self.inception(dct_image)
-        # Handle the dual output of InceptionV3 during training
-        if self.training:
-            freq_feat = inception_output.logits
-        else:
-            freq_feat = inception_output
+        # We need a single summary vector from the sequence of patches. Use .mean(dim=1).
+        M_all = self.consistency_attention(V_M_enhanced, O_tvf_expanded).mean(dim=1)
+        I_all = self.inconsistency_attention(V_I_enhanced, O_tvf_expanded).mean(dim=1)
         # --- END OF FIX ---
 
-        u_f = self.freq_proj(freq_feat)
+        G_M = torch.cat([M_all, O_tvf], dim=-1)
+        G_I = torch.cat([I_all, O_tvf], dim=-1)
 
-        return u_t, u_v_global, u_f, u_v_patches
+        return G_M, G_I
 
     def _calculate_contrastive_loss(self, u_t, u_v, u_f):
         # Normalize features for stable dot product
