@@ -7,28 +7,30 @@ from torch.optim import AdamW
 from PIL import Image
 import pandas as pd
 import numpy as np
-import argparse
 from tqdm import tqdm
 import os
 import warnings
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 import spacy
+import argparse  # --- NEW: Import argparse ---
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
-parser = argparse.ArgumentParser(description='Train SR-CIBN Model')
-parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+# --- NEW: Setup argparse ---
+parser = argparse.ArgumentParser(description='Train MGC-Net Model')
+parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training. Default: 8')
 args = parser.parse_args()
-BATCH_SIZE = args.batch_size
 
 # --- 1. Configuration ---
 CONFIG = {
+    # --- MODIFIED: Paths updated ---
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "image_dir": "../spams_detection/spam_datasets/crawler/LA/images/",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "epochs": 10,
-    "batch_size": BATCH_SIZE,  # Reduced batch size due to high memory usage of GATs and multiple models
+    # --- MODIFIED: Batch size from command line ---
+    "batch_size": args.batch_size,
     "learning_rate": 1e-4,
     "embedding_dim": 768,
     "attention_heads": 4,
@@ -41,10 +43,10 @@ CONFIG = {
 }
 
 print(f"Using device: {CONFIG['device']}")
+print(f"Batch Size: {CONFIG['batch_size']}")
 
 
 # --- 2. Helper Modules ---
-
 class GATLayer(nn.Module):
     def __init__(self, in_features, out_features, n_heads, alpha=0.2):
         super().__init__()
@@ -58,19 +60,14 @@ class GATLayer(nn.Module):
         N = h.size(0)
         if N == 0:
             return torch.zeros(0, self.W.out_features, device=h.device)
-
         Wh = self.W(h).view(N, self.n_heads, -1)
         out_features = Wh.size(-1)
-
         Wh_i = Wh.unsqueeze(1).expand(N, N, self.n_heads, out_features)
         Wh_j = Wh.unsqueeze(0).expand(N, N, self.n_heads, out_features)
         a_input = torch.cat([Wh_i, Wh_j], dim=-1)
-
         e = self.leakyrelu((a_input * self.a).sum(dim=-1))
-
         attention = torch.where(adj.unsqueeze(-1) > 0, e, -9e15 * torch.ones_like(e))
         attention = self.softmax(attention)
-
         h_prime = torch.einsum('ijh,jhd->ihd', attention, Wh)
         return F.elu(h_prime.reshape(N, self.n_heads * out_features))
 
@@ -86,6 +83,9 @@ class MGC_Net(nn.Module):
         self.bert = BertModel.from_pretrained(config["bert_model"])
         self.tokenizer = BertTokenizer.from_pretrained(config["bert_model"])
         self.vit = ViTModel.from_pretrained(config["vit_model"])
+        # --- NEW: Store processors in the model ---
+        self.vit_processor = ViTImageProcessor.from_pretrained(config["vit_model"])
+        self.clip_processor = CLIPProcessor.from_pretrained(config["clip_model"])
 
         self.token_cross_attention = nn.MultiheadAttention(self.embed_dim, 8, batch_first=True)
         self.nlp = spacy.load(config["spacy_model"])
@@ -95,7 +95,6 @@ class MGC_Net(nn.Module):
         self.image_gat = GATLayer(self.embed_dim, config["gat_out_features"], config["attention_heads"])
 
         self.clip = CLIPModel.from_pretrained(config["clip_model"])
-        self.clip_processor = CLIPProcessor.from_pretrained(config["clip_model"])
 
         self.fusion_mlp = nn.Sequential(nn.Linear(3, 16), nn.GELU(), nn.Linear(16, 3), nn.Sigmoid())
 
@@ -133,67 +132,68 @@ class MGC_Net(nn.Module):
                         adj[i, nr * grid_size + nc] = 1
         return torch.from_numpy(adj).float().to(self.device)
 
-    def forward(self, text_raw, image_input):
+    # --- MODIFIED: forward now accepts raw PIL images ---
+    def forward(self, text_raw, pil_images):
+        # Text processing (BERT)
         text_inputs = self.tokenizer(text_raw, padding='max_length', max_length=64, truncation=True,
                                      return_tensors="pt").to(self.device)
         text_features = self.bert(**text_inputs).last_hidden_state
-        image_features = self.vit(image_input).last_hidden_state[:, 1:, :]
 
+        # Image processing (ViT)
+        vit_inputs = self.vit_processor(images=pil_images, return_tensors="pt").to(self.device)
+        image_features = self.vit(**vit_inputs).last_hidden_state[:, 1:, :]
+
+        # Token-Level
         updated_text_features, _ = self.token_cross_attention(text_features, image_features, image_features)
         c_token_matrix = torch.bmm(updated_text_features, image_features.transpose(1, 2))
         s_token = torch.diagonal(c_token_matrix, dim1=-2, dim2=-1).mean(dim=1)
         f_token = self.token_proj(updated_text_features.mean(dim=1))
 
-        batch_size = text_features.shape[0]
-        bert_seq_len = text_features.shape[1]
+        # Phrase-Level
+        batch_size, bert_seq_len = text_features.shape[0], text_features.shape[1]
         updated_text_gat_list, updated_image_gat_list = [], []
         image_adj = self._get_image_graph(image_features.shape[1])
-
         for i in range(batch_size):
-            # --- START OF FIX ---
             text_adj_spacy = self._get_text_graph(text_raw[i])
             spacy_len = text_adj_spacy.shape[0]
             text_adj = torch.zeros((bert_seq_len, bert_seq_len), device=self.device)
             copy_len = min(spacy_len, bert_seq_len)
             text_adj[:copy_len, :copy_len] = text_adj_spacy[:copy_len, :copy_len]
             text_feat_i = text_features[i]
-            # --- END OF FIX ---
-
             text_gat_out = self.text_gat(text_feat_i, text_adj)
             if text_gat_out.size(0) > 0:
                 updated_text_gat_list.append(text_gat_out.mean(dim=0))
             else:
                 updated_text_gat_list.append(torch.zeros(self.text_gat.W.out_features, device=self.device))
-
             image_gat_out = self.image_gat(image_features[i], image_adj)
             updated_image_gat_list.append(image_gat_out.mean(dim=0))
-
         text_gat_features = torch.stack(updated_text_gat_list)
         image_gat_features = torch.stack(updated_image_gat_list)
         s_phrase = F.cosine_similarity(text_gat_features, image_gat_features, dim=1)
         f_phrase = self.phrase_proj(text_gat_features)
 
-        clip_inputs = self.clip_processor(text=text_raw, images=image_input, return_tensors="pt", padding=True).to(
-            self.device)
+        # Global-Level (CLIP)
+        # --- MODIFIED: Added truncation=True to fix warning ---
+        clip_inputs = self.clip_processor(text=text_raw, images=pil_images, return_tensors="pt", padding=True,
+                                          truncation=True).to(self.device)
         clip_outputs = self.clip(**clip_inputs)
         s_global = F.cosine_similarity(clip_outputs.text_embeds, clip_outputs.image_embeds, dim=1)
         f_global = self.global_proj(clip_outputs.text_embeds)
 
+        # Fusion
         consistency_scores = torch.stack([s_token, s_phrase, s_global], dim=1).detach()
         fusion_weights = self.fusion_mlp(consistency_scores)
         w_token, w_phrase, w_global = fusion_weights[:, 0], fusion_weights[:, 1], fusion_weights[:, 2]
-
-        f_agg = (w_token.unsqueeze(1) * f_token +
-                 w_phrase.unsqueeze(1) * f_phrase +
-                 w_global.unsqueeze(1) * f_global)
+        f_agg = (w_token.unsqueeze(1) * f_token + w_phrase.unsqueeze(1) * f_phrase + w_global.unsqueeze(1) * f_global)
 
         return self.classifier(f_agg)
 
 
-# --- 4. Dataset Class (Unchanged) ---
+# --- 4. Dataset Class ---
+# --- MODIFIED: Now returns raw PIL image ---
 class SpamReviewDataset(Dataset):
-    def __init__(self, df, image_processor, config):
-        self.df, self.image_processor, self.config = df, image_processor, config
+    def __init__(self, df, config):
+        self.df, self.config = df, config
 
     def __len__(self):
         return len(self.df)
@@ -207,22 +207,22 @@ class SpamReviewDataset(Dataset):
         if photo_ids and photo_ids != 'nan':
             image_path = os.path.join(self.config["image_dir"], f"{photo_ids.split('#')[0]}.jpg")
         try:
-            image = Image.open(image_path).convert('RGB') if os.path.exists(image_path) else Image.new('RGB',
-                                                                                                       (224, 224))
+            pil_image = Image.open(image_path).convert('RGB') if os.path.exists(image_path) else Image.new('RGB',
+                                                                                                           (224, 224))
         except Exception:
-            image = Image.new('RGB', (224, 224))
-        processed_image = self.image_processor(images=image, return_tensors="pt")['pixel_values'].squeeze(0)
-        return {'text_raw': text, 'image': processed_image, 'label': torch.tensor(label, dtype=torch.long)}
+            pil_image = Image.new('RGB', (224, 224))
+        return {'text_raw': text, 'pil_image': pil_image, 'label': torch.tensor(label, dtype=torch.long)}
 
 
-# --- 5. Training, Evaluation, and Testing Functions (Unchanged) ---
+# --- 5. Training, Evaluation, and Testing Functions ---
+# --- MODIFIED: Accept pil_images ---
 def train_epoch(model, data_loader, optimizer, device):
     model.train()
     total_loss, total_correct = 0, 0
     for batch in tqdm(data_loader, desc="Training"):
         optimizer.zero_grad()
-        text_raw, images, labels = batch['text_raw'], batch['image'].to(device), batch['label'].to(device)
-        logits = model(text_raw, images)
+        text_raw, pil_images, labels = batch['text_raw'], batch['pil_image'], batch['label'].to(device)
+        logits = model(text_raw, pil_images)
         loss = F.cross_entropy(logits, labels)
         loss.backward()
         optimizer.step()
@@ -236,8 +236,8 @@ def eval_model(model, data_loader, device):
     total_correct = 0
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Evaluating"):
-            text_raw, images, labels = batch['text_raw'], batch['image'].to(device), batch['label'].to(device)
-            logits = model(text_raw, images)
+            text_raw, pil_images, labels = batch['text_raw'], batch['pil_image'], batch['label'].to(device)
+            logits = model(text_raw, pil_images)
             total_correct += (torch.argmax(logits, dim=1) == labels).sum().item()
     return total_correct / len(data_loader.dataset)
 
@@ -247,8 +247,8 @@ def test_model(model, data_loader, device):
     all_labels, all_preds = [], []
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Testing"):
-            text_raw, images, labels = batch['text_raw'], batch['image'].to(device), batch['label'].to(device)
-            logits = model(text_raw, images)
+            text_raw, pil_images, labels = batch['text_raw'], batch['pil_image'], batch['label'].to(device)
+            logits = model(text_raw, pil_images)
             preds = torch.argmax(logits, dim=1)
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
@@ -260,7 +260,7 @@ def test_model(model, data_loader, device):
     print("--------------------")
 
 
-# --- 6. Main Execution Block (Unchanged) ---
+# --- 6. Main Execution Block ---
 if __name__ == '__main__':
     df = pd.read_csv(CONFIG["data_path"])
     df.dropna(subset=['content'], inplace=True)
@@ -268,14 +268,27 @@ if __name__ == '__main__':
 
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-    image_processor = ViTImageProcessor.from_pretrained(CONFIG["vit_model"])
-    train_dataset = SpamReviewDataset(train_df, image_processor, CONFIG)
-    val_dataset = SpamReviewDataset(val_df, image_processor, CONFIG)
-    test_dataset = SpamReviewDataset(test_df, image_processor, CONFIG)
+    # Dataset no longer needs the processor
+    train_dataset = SpamReviewDataset(train_df, CONFIG)
+    val_dataset = SpamReviewDataset(val_df, CONFIG)
+    test_dataset = SpamReviewDataset(test_df, CONFIG)
 
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2)
+
+    # Use a collate_fn to handle list of PIL images
+    def collate_fn(batch):
+        return {
+            'text_raw': [item['text_raw'] for item in batch],
+            'pil_image': [item['pil_image'] for item in batch],
+            'label': torch.stack([item['label'] for item in batch])
+        }
+
+
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=2,
+                              collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2,
+                            collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2,
+                             collate_fn=collate_fn)
 
     model = MGC_Net(CONFIG).to(CONFIG["device"])
     optimizer = AdamW(model.parameters(), lr=CONFIG["learning_rate"])
