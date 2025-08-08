@@ -141,26 +141,31 @@ class SR_CIBN(nn.Module):
     def _extract_unimodal_features(self, text_input, image_input):
         # Text features
         text_outputs = self.bert(**text_input)
-        # Use [CLS] token representation
         text_feat = text_outputs.last_hidden_state[:, 0, :]
         u_t = self.text_proj(text_feat)
 
         # Image Spatial features (from ViT)
-        # ViT also outputs patch embeddings and a [CLS] token like embedding
         vit_outputs = self.vit(image_input)
-        image_patches = vit_outputs.last_hidden_state[:, 1:, :]  # (B, 196, H)
-        image_global = vit_outputs.last_hidden_state[:, 0, :]  # (B, H)
+        image_patches = vit_outputs.last_hidden_state[:, 1:, :]
+        image_global = vit_outputs.last_hidden_state[:, 0, :]
         u_v_patches = self.vit_proj(image_patches)
         u_v_global = self.vit_proj(image_global)
 
         # Image Frequency features (DCT + Inception)
-        # Resize for InceptionV3
         inception_input = F.interpolate(image_input, size=(299, 299), mode='bilinear', align_corners=False)
         dct_image = self.dct(inception_input)
-        # InceptionV3 expects 3 channels
         if dct_image.shape[1] == 1:
             dct_image = dct_image.repeat(1, 3, 1, 1)
-        freq_feat = self.inception(dct_image)
+
+        # --- START OF FIX ---
+        inception_output = self.inception(dct_image)
+        # Handle the dual output of InceptionV3 during training
+        if self.training:
+            freq_feat = inception_output.logits
+        else:
+            freq_feat = inception_output
+        # --- END OF FIX ---
+
         u_f = self.freq_proj(freq_feat)
 
         return u_t, u_v_global, u_f, u_v_patches
