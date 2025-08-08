@@ -197,13 +197,11 @@ class ERumor:
 
 # --- Main Execution Block ---
 if __name__ == '__main__':
-    # 1. Load data and feature extractor
     df = pd.read_csv(CONFIG["data_path"])
     df.dropna(subset=['content', 'biz_alias'], inplace=True)
     tokenizer = BertTokenizer.from_pretrained(CONFIG["bert_model"])
     feature_extractor = FeatureExtractor(CONFIG["bert_model"])
 
-    # 2. Split events into base and novel
     all_events = df['biz_alias'].unique()
     base_event_ids, novel_event_ids = train_test_split(all_events, test_size=1.0 - CONFIG["base_event_ratio"],
                                                        random_state=42)
@@ -213,32 +211,26 @@ if __name__ == '__main__':
     print(f"Total businesses (events): {len(all_events)}")
     print(f"Base events: {len(base_event_ids)}, Novel events: {len(novel_event_ids)}")
 
-    # 3. Instantiate and "train" E-Rumor by calculating base distributions
     e_rumor = ERumor(feature_extractor, CONFIG, args)
     e_rumor.calculate_base_distributions(base_df, tokenizer)
 
-    # 4. Run few-shot evaluation episodes
     episode_accuracies = []
     print(f"\nStarting {args.n_episodes} few-shot evaluation episodes...")
     for episode in tqdm(range(args.n_episodes)):
-        # a. Select a novel event
         novel_event_id = np.random.choice(novel_event_ids)
         event_df = novel_df[novel_df['biz_alias'] == novel_event_id]
 
-        # b. Sample support and query sets
         support_df_list, query_df_list = [], []
         available_classes = event_df['is_recommended'].unique()
 
-        # Ensure we have at least k_shot + n_query samples for each class
         valid_classes = [c for c in available_classes if
                          event_df['is_recommended'].value_counts().get(c, 0) >= args.k_shot + args.n_query]
 
         if len(valid_classes) < CONFIG["num_classes"]:
-            continue  # Skip episode if not enough data
+            continue
 
         for class_id in valid_classes:
             class_df = event_df[event_df['is_recommended'] == class_id]
-            # Sample without replacement
             samples = class_df.sample(n=args.k_shot + args.n_query, replace=False)
             support_df_list.append(samples.head(args.k_shot))
             query_df_list.append(samples.tail(args.n_query))
@@ -248,27 +240,37 @@ if __name__ == '__main__':
         support_df = pd.concat(support_df_list)
         query_df = pd.concat(query_df_list)
 
-        # c. Extract features
         support_dataset = TextDataset(support_df, tokenizer)
         query_dataset = TextDataset(query_df, tokenizer)
 
+        # --- START OF FIX ---
+        # Use DataLoader to correctly batch the entire dataset
+        support_loader = DataLoader(support_dataset, batch_size=len(support_dataset))
+        query_loader = DataLoader(query_dataset, batch_size=len(query_dataset))
+
+        # Get the single batch containing all data
+        support_batch = next(iter(support_loader))
+        query_batch = next(iter(query_loader))
+
         with torch.no_grad():
-            support_feats = feature_extractor(support_dataset[:]['input_ids'].to(CONFIG["device"]),
-                                              support_dataset[:]['attention_mask'].to(CONFIG["device"]))
-            support_labels = support_dataset[:]['label'].to(CONFIG["device"])
-            query_feats = feature_extractor(query_dataset[:]['input_ids'].to(CONFIG["device"]),
-                                            query_dataset[:]['attention_mask'].to(CONFIG["device"]))
-            query_labels = query_dataset[:]['label'].to(CONFIG["device"])
+            support_feats = feature_extractor(
+                support_batch['input_ids'].to(CONFIG["device"]),
+                support_batch['attention_mask'].to(CONFIG["device"])
+            )
+            support_labels = support_batch['label'].to(CONFIG["device"])
 
-        # d. Fit the classifier on the support set
+            query_feats = feature_extractor(
+                query_batch['input_ids'].to(CONFIG["device"]),
+                query_batch['attention_mask'].to(CONFIG["device"])
+            )
+            query_labels = query_batch['label'].to(CONFIG["device"])
+        # --- END OF FIX ---
+
         e_rumor.fit(support_feats, support_labels)
-
-        # e. Predict on the query set and calculate accuracy
         predictions = e_rumor.predict(query_feats)
         accuracy = (predictions == query_labels).float().mean().item()
         episode_accuracies.append(accuracy)
 
-    # 5. Report final results
     if episode_accuracies:
         mean_accuracy = np.mean(episode_accuracies) * 100
         std_accuracy = np.std(episode_accuracies) * 100
