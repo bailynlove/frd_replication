@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from albumentations.core.composition import NUM_ONEOF_TRANSFORMS
+from sympy.utilities.lambdify import NUMPY
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.models import inception_v3, Inception_V3_Weights
@@ -21,15 +23,17 @@ warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser(description='Train SR-CIBN Model')
 parser.add_argument('--batch_size', '-bs', type=int, default=16, help='Batch size for training')
+parser.add_argument('--num_epochs', '-ne', type=int, default=10, help='Number of epochs for training')
 args = parser.parse_args()
 BATCH_SIZE = args.batch_size
+NUM_EPOCHS = args.num_epochs
 
 # --- 1. Configuration ---
 CONFIG = {
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "image_dir": "../spams_detection/spam_datasets/crawler/LA/images/",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "epochs": 20,  # The paper uses 120, but 20 is a good start for testing
+    "epochs": NUM_EPOCHS,  # The paper uses 120, but 20 is a good start for testing
     "batch_size": BATCH_SIZE,  # The paper uses 128, adjust based on your GPU VRAM
     "learning_rate": 1e-4,  # Paper uses 1e-3, but 1e-4 is often safer for transformers
     "embedding_dim": 256,  # d in the paper
