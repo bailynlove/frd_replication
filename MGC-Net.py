@@ -167,69 +167,70 @@ class MultiGranularityConsistencyNet(nn.Module):
         return torch.from_numpy(adj).float().to(self.device)
 
     def forward(self, text_raw, image_input):
-        # --- Base Feature Extraction ---
-        # --- START OF FIX ---
         text_inputs = self.tokenizer(text_raw, padding='max_length', max_length=64, truncation=True,
                                      return_tensors="pt").to(self.device)
-        # --- END OF FIX ---
-        text_features = self.bert(**text_inputs).last_hidden_state  # (B, L, D)
+        text_features = self.bert(**text_inputs).last_hidden_state
+        image_features = self.vit(image_input).last_hidden_state[:, 1:, :]
 
-        image_features = self.vit(image_input).last_hidden_state[:, 1:, :]  # (B, N_patches, D)
-
-        # ... (rest of the forward method is unchanged) ...
-
-        # --- 1. Token-Level Consistency ---
+        # --- Token-Level (Unchanged) ---
         updated_text_features, _ = self.token_cross_attention(text_features, image_features, image_features)
-        c_token_matrix = torch.bmm(updated_text_features, image_features.transpose(1, 2))  # (B, L, N_patches)
-        # Summarize consistency: mean of diagonal elements (simplified)
+        c_token_matrix = torch.bmm(updated_text_features, image_features.transpose(1, 2))
         s_token = torch.diagonal(c_token_matrix, dim1=-2, dim2=-1).mean(dim=1)
-        f_token = updated_text_features.mean(dim=1)  # (B, D)
+        f_token = self.token_proj(updated_text_features.mean(dim=1))
 
-        # --- 2. Phrase-Level Consistency (Processed per sample due to graph complexity) ---
+        # --- Phrase-Level (CORRECTED LOGIC) ---
         batch_size = text_features.shape[0]
+        bert_seq_len = text_features.shape[1]  # This will be 64
         updated_text_gat_list, updated_image_gat_list = [], []
         image_adj = self._get_image_graph(image_features.shape[1])
 
         for i in range(batch_size):
-            # Text GAT
-            text_adj = self._get_text_graph(text_raw[i])
-            # Align features with graph size
-            num_text_nodes = text_adj.shape[0]
-            text_feat_i = text_features[i, :num_text_nodes, :]
-            updated_text_gat_list.append(self.text_gat(text_feat_i, text_adj))
+            # --- START OF FIX ---
+            # 1. Get spaCy graph
+            text_adj_spacy = self._get_text_graph(text_raw[i])
+            spacy_len = text_adj_spacy.shape[0]
 
-            # Image GAT
-            image_feat_i = image_features[i]
-            updated_image_gat_list.append(self.image_gat(image_feat_i, image_adj))
+            # 2. Create a new adjacency matrix with the same sequence length as BERT features
+            text_adj = torch.zeros((bert_seq_len, bert_seq_len), device=self.device)
 
-        text_gat_features = torch.stack([f.mean(dim=0) for f in updated_text_gat_list])
-        image_gat_features = torch.stack([f.mean(dim=0) for f in updated_image_gat_list])
+            # 3. Copy the part of the spaCy graph that fits into the new matrix
+            copy_len = min(spacy_len, bert_seq_len)
+            text_adj[:copy_len, :copy_len] = text_adj_spacy[:copy_len, :copy_len]
 
-        # Simplified consistency score for phrase level
+            # 4. Use the full feature sequence from BERT, which now matches the new adj matrix size
+            text_feat_i = text_features[i]
+            # --- END OF FIX ---
+
+            text_gat_out = self.text_gat(text_feat_i, text_adj)
+            if text_gat_out.size(0) > 0:
+                updated_text_gat_list.append(text_gat_out.mean(dim=0))
+            else:
+                updated_text_gat_list.append(torch.zeros(self.text_gat.W.out_features, device=self.device))
+
+            image_gat_out = self.image_gat(image_features[i], image_adj)
+            updated_image_gat_list.append(image_gat_out.mean(dim=0))
+
+        text_gat_features = torch.stack(updated_text_gat_list)
+        image_gat_features = torch.stack(updated_image_gat_list)
         s_phrase = F.cosine_similarity(text_gat_features, image_gat_features, dim=1)
-        f_phrase = text_gat_features  # (B, D)
+        f_phrase = self.phrase_proj(text_gat_features)
 
-        # --- 3. Global-Level Consistency ---
+        # --- Global-Level and Fusion (Unchanged) ---
         clip_inputs = self.clip_processor(text=text_raw, images=image_input, return_tensors="pt", padding=True).to(
             self.device)
         clip_outputs = self.clip(**clip_inputs)
-        s_global = self.clip.logit_scale.exp() * F.cosine_similarity(clip_outputs.text_embeds,
-                                                                     clip_outputs.image_embeds, dim=1)
-        f_global = self.clip_feat_proj(clip_outputs.text_embeds)  # (B, D)
+        s_global = F.cosine_similarity(clip_outputs.text_embeds, clip_outputs.image_embeds, dim=1)
+        f_global = self.global_proj(clip_outputs.text_embeds)
 
-        # --- 4. Adaptive Fusion ---
-        consistency_scores = torch.stack([s_token, s_phrase, s_global], dim=1).detach()  # (B, 3)
-        fusion_weights = self.fusion_mlp(consistency_scores)  # (B, 3)
-
+        consistency_scores = torch.stack([s_token, s_phrase, s_global], dim=1).detach()
+        fusion_weights = self.fusion_mlp(consistency_scores)
         w_token, w_phrase, w_global = fusion_weights[:, 0], fusion_weights[:, 1], fusion_weights[:, 2]
 
         f_agg = (w_token.unsqueeze(1) * f_token +
                  w_phrase.unsqueeze(1) * f_phrase +
                  w_global.unsqueeze(1) * f_global)
 
-        # --- 5. Classification ---
-        logits = self.classifier(f_agg)
-        return logits
+        return self.classifier(f_agg)
 
 
 # --- 4. Dataset Class ---
