@@ -46,6 +46,7 @@ CONFIG = {
     "contrastive_temp": 0.05,  # τ for contrastive loss
     "bert_model": "bert-base-uncased",
     "vit_model": "google/vit-base-patch16-224-in21k",
+    "best_model_path": "sr_cibn_best_model.pth"
 }
 
 print(f"Using device: {CONFIG['device']}")
