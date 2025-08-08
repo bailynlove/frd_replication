@@ -94,6 +94,9 @@ class MultiGranularityConsistencyNet(nn.Module):
 
         # Base Encoders
         self.bert = BertModel.from_pretrained(config["bert_model"])
+        # --- START OF FIX ---
+        self.tokenizer = BertTokenizer.from_pretrained(config["bert_model"])
+        # --- END OF FIX ---
         self.vit = ViTModel.from_pretrained(config["vit_model"])
 
         # Token-Level
@@ -160,11 +163,15 @@ class MultiGranularityConsistencyNet(nn.Module):
 
     def forward(self, text_raw, image_input):
         # --- Base Feature Extraction ---
-        text_inputs = self.bert.tokenizer(text_raw, padding='max_length', max_length=64, truncation=True,
-                                          return_tensors="pt").to(self.device)
+        # --- START OF FIX ---
+        text_inputs = self.tokenizer(text_raw, padding='max_length', max_length=64, truncation=True,
+                                     return_tensors="pt").to(self.device)
+        # --- END OF FIX ---
         text_features = self.bert(**text_inputs).last_hidden_state  # (B, L, D)
 
         image_features = self.vit(image_input).last_hidden_state[:, 1:, :]  # (B, N_patches, D)
+
+        # ... (rest of the forward method is unchanged) ...
 
         # --- 1. Token-Level Consistency ---
         updated_text_features, _ = self.token_cross_attention(text_features, image_features, image_features)
