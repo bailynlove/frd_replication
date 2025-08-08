@@ -27,7 +27,7 @@ CONFIG = {
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "image_dir": "../spams_detection/spam_datasets/crawler/LA/images/",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "epochs": 20,
+    "epochs": 6,
     "learning_rate": 1e-5,
     "bert_model": "bert-base-uncased",
     "vit_model": "google/vit-base-patch16-224-in21k",
