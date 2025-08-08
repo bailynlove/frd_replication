@@ -45,105 +45,73 @@ print(f"Using device: {CONFIG['device']}")
 # --- 2. Helper Modules ---
 
 class GATLayer(nn.Module):
-    """A single Graph Attention Network (GAT) layer (corrected and simplified)."""
-
     def __init__(self, in_features, out_features, n_heads, alpha=0.2):
         super().__init__()
         self.n_heads = n_heads
-        self.in_features = in_features
-        self.out_features = out_features
-
-        # This single linear layer is more efficient
         self.W = nn.Linear(in_features, out_features * n_heads, bias=False)
-        # Attention mechanism
         self.a = nn.Parameter(torch.randn(size=(1, n_heads, 2 * out_features)))
-
         self.leakyrelu = nn.LeakyReLU(alpha)
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, h, adj):
-        # h: (N, in_features), adj: (N, N)
         N = h.size(0)
+        if N == 0:
+            return torch.zeros(0, self.W.out_features, device=h.device)
 
-        # 1. Apply linear transformation
-        Wh = self.W(h).view(N, self.n_heads, self.out_features)  # (N, n_heads, out_features)
+        Wh = self.W(h).view(N, self.n_heads, -1)
+        out_features = Wh.size(-1)
 
-        # 2. Prepare for attention score calculation
-        Wh_i = Wh.unsqueeze(1).expand(N, N, self.n_heads, self.out_features)
-        Wh_j = Wh.unsqueeze(0).expand(N, N, self.n_heads, self.out_features)
-        a_input = torch.cat([Wh_i, Wh_j], dim=-1)  # (N, N, n_heads, 2*out_features)
+        Wh_i = Wh.unsqueeze(1).expand(N, N, self.n_heads, out_features)
+        Wh_j = Wh.unsqueeze(0).expand(N, N, self.n_heads, out_features)
+        a_input = torch.cat([Wh_i, Wh_j], dim=-1)
 
-        # 3. Calculate attention scores
-        e = self.leakyrelu((a_input * self.a).sum(dim=-1))  # (N, N, n_heads)
+        e = self.leakyrelu((a_input * self.a).sum(dim=-1))
 
-        # 4. Mask with adjacency matrix
-        zero_vec = -9e15 * torch.ones_like(e)
-        attention = torch.where(adj.unsqueeze(-1) > 0, e, zero_vec)  # Use unsqueeze to broadcast adj
+        attention = torch.where(adj.unsqueeze(-1) > 0, e, -9e15 * torch.ones_like(e))
         attention = self.softmax(attention)
 
-        # 5. Apply attention to get new features
-        h_prime = torch.einsum('ijh,jhd->ihd', attention, Wh)  # (N, n_heads, out_features)
-
-        # Concatenate heads and apply final activation
-        return F.elu(h_prime.reshape(N, self.n_heads * self.out_features))
+        h_prime = torch.einsum('ijh,jhd->ihd', attention, Wh)
+        return F.elu(h_prime.reshape(N, self.n_heads * out_features))
 
 
 # --- 3. The Main Model ---
-
-class MultiGranularityConsistencyNet(nn.Module):
+class MGC_Net(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.device = config["device"]
         self.embed_dim = config["embedding_dim"]
 
-        # Base Encoders
         self.bert = BertModel.from_pretrained(config["bert_model"])
-        # --- START OF FIX ---
         self.tokenizer = BertTokenizer.from_pretrained(config["bert_model"])
-        # --- END OF FIX ---
         self.vit = ViTModel.from_pretrained(config["vit_model"])
 
-        # Token-Level
-        self.token_cross_attention = nn.MultiheadAttention(self.embed_dim, config["attention_heads"], batch_first=True)
-
-        # Phrase-Level
+        self.token_cross_attention = nn.MultiheadAttention(self.embed_dim, 8, batch_first=True)
         self.nlp = spacy.load(config["spacy_model"])
-        self.text_gat = GATLayer(self.embed_dim, self.embed_dim // config["attention_heads"], config["attention_heads"])
-        self.image_gat = GATLayer(self.embed_dim, self.embed_dim // config["attention_heads"],
-                                  config["attention_heads"])
 
-        # Global-Level
+        gat_out_dim = config["gat_out_features"] * config["attention_heads"]
+        self.text_gat = GATLayer(self.embed_dim, config["gat_out_features"], config["attention_heads"])
+        self.image_gat = GATLayer(self.embed_dim, config["gat_out_features"], config["attention_heads"])
+
         self.clip = CLIPModel.from_pretrained(config["clip_model"])
         self.clip_processor = CLIPProcessor.from_pretrained(config["clip_model"])
 
-        # Adaptive Fusion Module
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(3, 16),
-            nn.GELU(),
-            nn.Linear(16, 3),
-            nn.Sigmoid()
-        )
-        # Project CLIP features to common embedding dim for weighted sum
-        self.clip_feat_proj = nn.Linear(self.clip.config.text_config.hidden_size, self.embed_dim)
+        self.fusion_mlp = nn.Sequential(nn.Linear(3, 16), nn.GELU(), nn.Linear(16, 3), nn.Sigmoid())
 
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(self.embed_dim, self.embed_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(self.embed_dim // 2, 2)
-        )
+        self.token_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.phrase_proj = nn.Linear(gat_out_dim, self.embed_dim)
+        self.global_proj = nn.Linear(self.clip.config.text_config.hidden_size, self.embed_dim)
+
+        self.classifier = nn.Sequential(nn.Linear(self.embed_dim, self.embed_dim // 2), nn.ReLU(), nn.Dropout(0.3),
+                                        nn.Linear(self.embed_dim // 2, 2))
 
     def _get_text_graph(self, text_sample):
         doc = self.nlp(text_sample)
-        # Use tokens from spacy doc to align with BERT wordpieces later
-        # This is a simplification; a robust implementation would use subword alignment
         num_tokens = len(doc)
         adj = np.zeros((num_tokens, num_tokens))
         for token in doc:
             if token.i < num_tokens:
-                adj[token.i, token.i] = 1  # Self-loop
+                adj[token.i, token.i] = 1
                 for child in token.children:
                     if child.i < num_tokens:
                         adj[token.i, child.i] = 1
@@ -151,19 +119,17 @@ class MultiGranularityConsistencyNet(nn.Module):
         return torch.from_numpy(adj).float().to(self.device)
 
     def _get_image_graph(self, num_patches=196):
-        # Simple 8-connectivity grid graph for ViT patches (14x14 grid)
         grid_size = int(np.sqrt(num_patches))
         adj = np.zeros((num_patches, num_patches))
         for i in range(num_patches):
-            adj[i, i] = 1  # Self-loop
+            adj[i, i] = 1
             row, col = i // grid_size, i % grid_size
             for dr in [-1, 0, 1]:
                 for dc in [-1, 0, 1]:
                     if dr == 0 and dc == 0: continue
                     nr, nc = row + dr, col + dc
                     if 0 <= nr < grid_size and 0 <= nc < grid_size:
-                        neighbor_idx = nr * grid_size + nc
-                        adj[i, neighbor_idx] = 1
+                        adj[i, nr * grid_size + nc] = 1
         return torch.from_numpy(adj).float().to(self.device)
 
     def forward(self, text_raw, image_input):
@@ -172,32 +138,23 @@ class MultiGranularityConsistencyNet(nn.Module):
         text_features = self.bert(**text_inputs).last_hidden_state
         image_features = self.vit(image_input).last_hidden_state[:, 1:, :]
 
-        # --- Token-Level (Unchanged) ---
         updated_text_features, _ = self.token_cross_attention(text_features, image_features, image_features)
         c_token_matrix = torch.bmm(updated_text_features, image_features.transpose(1, 2))
         s_token = torch.diagonal(c_token_matrix, dim1=-2, dim2=-1).mean(dim=1)
         f_token = self.token_proj(updated_text_features.mean(dim=1))
 
-        # --- Phrase-Level (CORRECTED LOGIC) ---
         batch_size = text_features.shape[0]
-        bert_seq_len = text_features.shape[1]  # This will be 64
+        bert_seq_len = text_features.shape[1]
         updated_text_gat_list, updated_image_gat_list = [], []
         image_adj = self._get_image_graph(image_features.shape[1])
 
         for i in range(batch_size):
             # --- START OF FIX ---
-            # 1. Get spaCy graph
             text_adj_spacy = self._get_text_graph(text_raw[i])
             spacy_len = text_adj_spacy.shape[0]
-
-            # 2. Create a new adjacency matrix with the same sequence length as BERT features
             text_adj = torch.zeros((bert_seq_len, bert_seq_len), device=self.device)
-
-            # 3. Copy the part of the spaCy graph that fits into the new matrix
             copy_len = min(spacy_len, bert_seq_len)
             text_adj[:copy_len, :copy_len] = text_adj_spacy[:copy_len, :copy_len]
-
-            # 4. Use the full feature sequence from BERT, which now matches the new adj matrix size
             text_feat_i = text_features[i]
             # --- END OF FIX ---
 
@@ -215,7 +172,6 @@ class MultiGranularityConsistencyNet(nn.Module):
         s_phrase = F.cosine_similarity(text_gat_features, image_gat_features, dim=1)
         f_phrase = self.phrase_proj(text_gat_features)
 
-        # --- Global-Level and Fusion (Unchanged) ---
         clip_inputs = self.clip_processor(text=text_raw, images=image_input, return_tensors="pt", padding=True).to(
             self.device)
         clip_outputs = self.clip(**clip_inputs)
@@ -233,7 +189,7 @@ class MultiGranularityConsistencyNet(nn.Module):
         return self.classifier(f_agg)
 
 
-# --- 4. Dataset Class ---
+# --- 4. Dataset Class (Unchanged) ---
 class SpamReviewDataset(Dataset):
     def __init__(self, df, image_processor, config):
         self.df, self.image_processor, self.config = df, image_processor, config
@@ -258,7 +214,7 @@ class SpamReviewDataset(Dataset):
         return {'text_raw': text, 'image': processed_image, 'label': torch.tensor(label, dtype=torch.long)}
 
 
-# --- 5. Training, Evaluation, and Testing Functions ---
+# --- 5. Training, Evaluation, and Testing Functions (Unchanged) ---
 def train_epoch(model, data_loader, optimizer, device):
     model.train()
     total_loss, total_correct = 0, 0
@@ -303,7 +259,7 @@ def test_model(model, data_loader, device):
     print("--------------------")
 
 
-# --- 6. Main Execution Block ---
+# --- 6. Main Execution Block (Unchanged) ---
 if __name__ == '__main__':
     df = pd.read_csv(CONFIG["data_path"])
     df.dropna(subset=['content'], inplace=True)
@@ -320,7 +276,7 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2)
     test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2)
 
-    model = MultiGranularityConsistencyNet(CONFIG).to(CONFIG["device"])
+    model = MGC_Net(CONFIG).to(CONFIG["device"])
     optimizer = AdamW(model.parameters(), lr=CONFIG["learning_rate"])
     best_val_acc = 0.0
 
