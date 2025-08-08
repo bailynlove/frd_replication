@@ -13,7 +13,7 @@ import warnings
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import argparse
-from torch_geometric.nn import GATConv  # 使用GAT作为Graph Transformer的基础
+from torch_geometric.nn import GATConv
 from torch_geometric.data import Data, Batch
 from collections import defaultdict
 
@@ -102,30 +102,35 @@ class CRFND(nn.Module):
             nn.Linear(config["hidden_dim"], config["num_classes"])
         )
 
-    def get_semantic_features(self, text_ids, text_mask, images, bow_vector):
+    def get_semantic_features(self, bert_input_ids, bert_attention_mask, clip_input_ids, clip_attention_mask,
+                              images, bow_vector):
         text_feat = self.text_proj(
-            self.bert(input_ids=text_ids, attention_mask=text_mask).last_hidden_state.mean(dim=1))
+            self.bert(input_ids=bert_input_ids, attention_mask=bert_attention_mask).last_hidden_state.mean(dim=1))
         image_feat = self.image_proj(self.vit(pixel_values=images).last_hidden_state.mean(dim=1))
 
-        clip_text = self.clip.get_text_features(input_ids=text_ids, attention_mask=text_mask)
-        clip_image = self.clip.get_image_features(pixel_values=images)
-        clip_feat = self.clip_proj(clip_text * clip_image)  # 元素积融合
+        with torch.no_grad():
+            # --- 修正点: 使用专门为CLIP准备的输入 ---
+            clip_text = self.clip.get_text_features(input_ids=clip_input_ids, attention_mask=clip_attention_mask)
+            clip_image = self.clip.get_image_features(pixel_values=images)
+        clip_feat = self.clip_proj(clip_text * clip_image)
 
-        topic_feat, _ = self.topic_vae(bow_vector)
+        topic_feat_z, _, _ = self.topic_vae(bow_vector)
+        topic_feat = self.topic_proj(topic_feat_z)
 
-        # 简单的拼接融合
-        mns_features = text_feat + image_feat + clip_feat + topic_feat
+        mns_features = self.mns_fusion(torch.cat([text_feat, image_feat, clip_feat, topic_feat], dim=1))
         return mns_features, text_feat, image_feat
 
-    def forward(self, text_ids, text_mask, images, bow_vector, graph_batch):
-        mns_features, text_feat, image_feat = self.get_semantic_features(text_ids, text_mask, images, bow_vector)
+    def forward(self, bert_input_ids, bert_attention_mask, clip_input_ids, clip_attention_mask, images, bow_vector,
+                graph_batch):
+        mns_features, text_feat, image_feat = self.get_semantic_features(bert_input_ids, bert_attention_mask,
+                                                                         clip_input_ids, clip_attention_mask,
+                                                                         images, bow_vector)
         graph_features = self.graph_transformer(graph_batch)
 
-        # 计算不一致性分数
-        inconsistency_img_text = 1 - F.cosine_similarity(image_feat, text_feat, dim=1)
-        inconsistency_graph_sem = 1 - F.cosine_similarity(graph_features, mns_features, dim=1)
+        epsilon = 1e-8
+        inconsistency_img_text = 1 - F.cosine_similarity(image_feat, text_feat, dim=1, eps=epsilon)
+        inconsistency_graph_sem = 1 - F.cosine_similarity(graph_features, mns_features, dim=1, eps=epsilon)
 
-        # 拼接所有特征进行分类
         final_features = torch.cat([mns_features, inconsistency_img_text.unsqueeze(1) * mns_features,
                                     inconsistency_graph_sem.unsqueeze(1) * mns_features], dim=1)
 
@@ -205,22 +210,18 @@ class SpamPropagationDataset(Dataset):
 
 
 # --- 主执行块 ---
+# --- 主执行块 ---
 if __name__ == '__main__':
     df = pd.read_csv(CONFIG["data_path"])
     df.dropna(subset=['content', 'author_name', 'biz_name'], inplace=True)
 
-    # 构建全局图用于模拟
-    users = df['author_name'].unique()
-    businesses = df['biz_name'].unique()
-    user_map = {name: i for i, name in enumerate(users)}
-    biz_map = {name: i for i, name in enumerate(businesses)}
+    users, businesses = df['author_name'].unique(), df['biz_name'].unique()
+    user_map, biz_map = {name: i for i, name in enumerate(users)}, {name: i for i, name in enumerate(businesses)}
     num_nodes = len(users) + len(businesses)
     adj_matrix = np.zeros((num_nodes, num_nodes), dtype=int)
     for _, row in df.iterrows():
-        u_idx = user_map[row['author_name']]
-        b_idx = biz_map[row['biz_name']] + len(users)
-        adj_matrix[u_idx, b_idx] = 1
-        adj_matrix[b_idx, u_idx] = 1
+        u_idx, b_idx = user_map[row['author_name']], biz_map[row['biz_name']] + len(users)
+        adj_matrix[u_idx, b_idx] = adj_matrix[b_idx, u_idx] = 1
 
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
     train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=42)
@@ -233,6 +234,7 @@ if __name__ == '__main__':
     test_dataset = SpamPropagationDataset(test_df, tokenizer, image_processor, user_map, biz_map, adj_matrix)
 
 
+    # --- 修正点: 修改 collate_fn 以生成两套文本输入 ---
     def collate_fn(batch):
         texts = [item['text'] for item in batch]
         images = [item['image'] for item in batch]
@@ -240,14 +242,24 @@ if __name__ == '__main__':
         bow_vectors = torch.stack([item['bow_vector'] for item in batch])
         graph_data_list = [item['graph_data'] for item in batch]
 
-        text_inputs = tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
+        # 输入给BERT (可以处理较长文本)
+        bert_inputs = tokenizer(texts, padding='max_length', max_length=128, truncation=True, return_tensors='pt')
+
+        # 输入给CLIP (必须限制在77)
+        clip_inputs = tokenizer(texts, padding='max_length', max_length=77, truncation=True, return_tensors='pt')
+
         image_inputs = image_processor(images, return_tensors='pt')
         graph_batch = Batch.from_data_list(graph_data_list)
 
         return {
-            'text_ids': text_inputs['input_ids'], 'text_mask': text_inputs['attention_mask'],
-            'images': image_inputs['pixel_values'], 'labels': labels,
-            'bow_vector': bow_vectors, 'graph_batch': graph_batch
+            'bert_input_ids': bert_inputs['input_ids'],
+            'bert_attention_mask': bert_inputs['attention_mask'],
+            'clip_input_ids': clip_inputs['input_ids'],
+            'clip_attention_mask': clip_inputs['attention_mask'],
+            'images': image_inputs['pixel_values'],
+            'labels': labels,
+            'bow_vector': bow_vectors,
+            'graph_batch': graph_batch
         }
 
 
@@ -261,58 +273,92 @@ if __name__ == '__main__':
     best_val_acc = 0.0
     for epoch in range(CONFIG["epochs"]):
         model.train()
+        total_loss, total_correct = 0, 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1} Training"):
             optimizer.zero_grad()
+
+            with torch.no_grad():
+                node_inputs = batch['graph_batch'].node_inputs.to(CONFIG['device'])
+                node_features = model.bert(**node_inputs).last_hidden_state.mean(dim=1)
+            batch['graph_batch'].x = node_features
+
+            # --- 修正点: 传递两套文本输入给模型 ---
             logits, mns_feat, graph_feat = model(
-                text_ids=batch['text_ids'].to(CONFIG["device"]), text_mask=batch['text_mask'].to(CONFIG["device"]),
-                images=batch['images'].to(CONFIG["device"]), bow_vector=batch['bow_vector'].to(CONFIG["device"]),
+                bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
+                bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
+                clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
+                clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
+                images=batch['images'].to(CONFIG["device"]),
+                bow_vector=batch['bow_vector'].to(CONFIG["device"]),
                 graph_batch=batch['graph_batch'].to(CONFIG["device"])
             )
 
-            # 对比学习损失 (简化版)
             labels = batch['labels'].to(CONFIG["device"])
             positive_mask = (labels == 1)
+            loss_cl = 0.0
             if positive_mask.sum() > 1:
-                pos_mns = mns_feat[positive_mask]
-                pos_graph = graph_feat[positive_mask]
+                pos_mns, pos_graph = mns_feat[positive_mask], graph_feat[positive_mask]
                 sim_matrix = F.cosine_similarity(pos_mns.unsqueeze(1), pos_graph.unsqueeze(0), dim=2)
-                loss_cl = F.cross_entropy(sim_matrix, torch.arange(len(pos_mns)).to(CONFIG["device"]))
-            else:
-                loss_cl = 0.0
+                loss_cl = F.cross_entropy(sim_matrix, torch.arange(len(pos_mns), device=CONFIG["device"]))
 
             loss_ce = F.cross_entropy(logits, labels)
-            loss = loss_ce + 0.1 * loss_cl  # 组合损失
-            loss.backward()
-            optimizer.step()
+            loss = loss_ce + 0.1 * loss_cl
 
-        # 验证
+            if not torch.isnan(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip_value"])
+                optimizer.step()
+                total_loss += loss.item()
+
+            total_correct += (logits.argmax(1) == labels).sum().item()
+
+        train_acc = total_correct / len(train_dataset)
+        train_loss = total_loss / len(train_loader)
+
         model.eval()
         val_correct = 0
         with torch.no_grad():
             for batch in val_loader:
+                with torch.no_grad():
+                    node_inputs = batch['graph_batch'].node_inputs.to(CONFIG['device'])
+                    node_features = model.bert(**node_inputs).last_hidden_state.mean(dim=1)
+                batch['graph_batch'].x = node_features
+
                 logits, _, _ = model(
-                    text_ids=batch['text_ids'].to(CONFIG["device"]), text_mask=batch['text_mask'].to(CONFIG["device"]),
-                    images=batch['images'].to(CONFIG["device"]), bow_vector=batch['bow_vector'].to(CONFIG["device"]),
+                    bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
+                    bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
+                    clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
+                    clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
+                    images=batch['images'].to(CONFIG["device"]),
+                    bow_vector=batch['bow_vector'].to(CONFIG["device"]),
                     graph_batch=batch['graph_batch'].to(CONFIG["device"])
                 )
                 val_correct += (logits.argmax(1) == batch['labels'].to(CONFIG["device"])).sum().item()
         val_acc = val_correct / len(val_dataset)
-        print(f"Epoch {epoch + 1}: Val Acc={val_acc:.4f}")
+        print(f"Epoch {epoch + 1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f} | Val Acc={val_acc:.4f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), CONFIG["best_model_path"])
 
-    # 测试
     print("\nTesting...")
     model.load_state_dict(torch.load(CONFIG["best_model_path"]))
     model.eval()
     all_labels, all_preds = [], []
     with torch.no_grad():
         for batch in test_loader:
+            with torch.no_grad():
+                node_inputs = batch['graph_batch'].node_inputs.to(CONFIG['device'])
+                node_features = model.bert(**node_inputs).last_hidden_state.mean(dim=1)
+            batch['graph_batch'].x = node_features
+
             logits, _, _ = model(
-                text_ids=batch['text_ids'].to(CONFIG["device"]), text_mask=batch['text_mask'].to(CONFIG["device"]),
-                images=batch['images'].to(CONFIG["device"]), bow_vector=batch['bow_vector'].to(CONFIG["device"]),
+                bert_input_ids=batch['bert_input_ids'].to(CONFIG["device"]),
+                bert_attention_mask=batch['bert_attention_mask'].to(CONFIG["device"]),
+                clip_input_ids=batch['clip_input_ids'].to(CONFIG["device"]),
+                clip_attention_mask=batch['clip_attention_mask'].to(CONFIG["device"]),
+                images=batch['images'].to(CONFIG["device"]),
+                bow_vector=batch['bow_vector'].to(CONFIG["device"]),
                 graph_batch=batch['graph_batch'].to(CONFIG["device"])
             )
             all_preds.extend(logits.argmax(1).cpu().numpy())
