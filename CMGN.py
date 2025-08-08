@@ -14,7 +14,7 @@ import argparse
 # 导入PyTorch Geometric (PyG) 和 sentence-transformers
 from torch_geometric.nn import GCNConv
 from torch_geometric.data import Data, Batch
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 
 warnings.filterwarnings("ignore")
 
