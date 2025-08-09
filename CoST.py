@@ -26,7 +26,7 @@ args = parser.parse_args()
 CONFIG = {
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "epochs": 20,
+    "epochs": 3,
     "learning_rate": 1e-4,
     "bert_model": "bert-base-uncased",
     "hidden_dim": 128,
