@@ -14,8 +14,6 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import argparse
 from torch_geometric.nn import GATConv
 from torch_geometric.data import Data, Batch
-from torch_geometric.utils import to_networkx
-import networkx as nx
 
 warnings.filterwarnings("ignore")
 
@@ -40,10 +38,7 @@ print(f"使用设备: {CONFIG['device']}")
 
 
 # --- 模型子模块 ---
-
 class GA_LSTMCell(nn.Module):
-    """图注意力LSTM单元"""
-
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -52,41 +47,43 @@ class GA_LSTMCell(nn.Module):
         self.linear_hh = nn.Linear(hidden_dim, 4 * hidden_dim)
 
     def forward(self, x, h_prev, c_prev, edge_index):
-        # x: (N, input_dim), h_prev: (N, hidden_dim), c_prev: (N, hidden_dim)
-        # 使用GAT聚合邻居信息
         h_agg = self.gat(torch.cat([x, h_prev], dim=1), edge_index)
-
         gates = self.linear_ih(h_agg) + self.linear_hh(h_prev)
         ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
-
-        ingate = torch.sigmoid(ingate)
-        forgetgate = torch.sigmoid(forgetgate)
-        cellgate = torch.tanh(cellgate)
-        outgate = torch.sigmoid(outgate)
-
+        ingate, forgetgate, cellgate, outgate = torch.sigmoid(ingate), torch.sigmoid(forgetgate), torch.tanh(
+            cellgate), torch.sigmoid(outgate)
         c_next = (forgetgate * c_prev) + (ingate * cellgate)
         h_next = outgate * torch.tanh(c_next)
         return h_next, c_next
 
 
-class TemporalEncoder(nn.Module):
-    """时序学习模块"""
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :].to(x.device)
+        return x
+
+
+class TemporalEncoder(nn.Module):
     def __init__(self, embed_dim, n_heads=4):
         super().__init__()
-        self.pos_encoder = nn.Parameter(torch.zeros(512, embed_dim))  # 位置编码
+        self.pos_encoder = PositionalEncoding(embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=n_heads, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-    def forward(self, x, timestamps):
-        # x: (B, SeqLen, EmbDim)
-        # 简单的基于时间戳的位置编码
-        seq_len = x.size(1)
-        x = x + self.pos_encoder[:seq_len, :].unsqueeze(0)
+    def forward(self, x):
+        x = self.pos_encoder(x)
         return self.transformer_encoder(x)
 
 
-# --- 主模型 CoST ---
 class CoST(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -94,20 +91,9 @@ class CoST(nn.Module):
         self.bert = BertModel.from_pretrained(config["bert_model"])
         bert_dim = self.bert.config.hidden_size
         self.feature_proj = nn.Linear(bert_dim, config["hidden_dim"])
-
-        # 结构化学习模块
         self.ga_lstm_cell = GA_LSTMCell(config["hidden_dim"], config["hidden_dim"])
-
-        # 时序化学习模块
         self.temporal_encoder = TemporalEncoder(config["hidden_dim"])
-
-        # 融合模块
-        self.gate = nn.Sequential(
-            nn.Linear(config["hidden_dim"] * 2, config["hidden_dim"]),
-            nn.Sigmoid()
-        )
-
-        # 分类器
+        self.gate = nn.Sequential(nn.Linear(config["hidden_dim"] * 2, config["hidden_dim"]), nn.Sigmoid())
         self.classifier = nn.Sequential(
             nn.Linear(config["hidden_dim"], config["hidden_dim"] // 2),
             nn.ReLU(),
@@ -115,47 +101,44 @@ class CoST(nn.Module):
         )
 
     def forward(self, graph_batch):
-        # 1. 获取初始节点特征
         with torch.no_grad():
             node_features = self.bert(input_ids=graph_batch.input_ids,
                                       attention_mask=graph_batch.attention_mask).last_hidden_state.mean(dim=1)
         x = self.feature_proj(node_features)
 
-        # 2. 结构化学习 (Bi-GA-LSTM)
-        # 简化实现：只做一次迭代更新，而不是完整的双向遍历
         h = torch.zeros(x.size(0), self.config["hidden_dim"], device=self.config["device"])
         c = torch.zeros(x.size(0), self.config["hidden_dim"], device=self.config["device"])
         h_struct, _ = self.ga_lstm_cell(x, h, c, graph_batch.edge_index)
 
-        # 池化得到图的结构表示
         from torch_geometric.nn import global_mean_pool
         struct_feat = global_mean_pool(h_struct, graph_batch.batch)
 
-        # 3. 时序化学习
-        # 将每个图的节点按时间排序
         temporal_inputs = []
         for i in range(graph_batch.num_graphs):
             graph_slice = graph_batch[i]
-            if graph_slice.t.numel() > 0:
+            nodes_in_graph = x[graph_batch.ptr[i]:graph_batch.ptr[i + 1]]
+            if graph_slice.t.numel() > 0 and nodes_in_graph.numel() > 0:
                 sorted_indices = torch.argsort(graph_slice.t)
-                temporal_inputs.append(x[graph_batch.ptr[i]:graph_batch.ptr[i + 1]][sorted_indices])
+                if sorted_indices.max() < len(nodes_in_graph):
+                    temporal_inputs.append(nodes_in_graph[sorted_indices])
+                else:
+                    temporal_inputs.append(nodes_in_graph)
             else:
-                temporal_inputs.append(x[graph_batch.ptr[i]:graph_batch.ptr[i + 1]])
+                temporal_inputs.append(nodes_in_graph)
 
-        # 填充到相同长度
         padded_temporal = nn.utils.rnn.pad_sequence(temporal_inputs, batch_first=True)
-        temp_feat = self.temporal_encoder(padded_temporal, None).mean(dim=1)
+        if padded_temporal.numel() > 0:
+            temp_feat = self.temporal_encoder(padded_temporal).mean(dim=1)
+        else:
+            temp_feat = torch.zeros_like(struct_feat)
 
-        # 4. 门控融合
         gate_val = self.gate(torch.cat([struct_feat, temp_feat], dim=1))
         fused_feat = gate_val * struct_feat + (1 - gate_val) * temp_feat
 
-        # 5. 分类
         logits = self.classifier(fused_feat)
         return logits
 
 
-# --- 数据集 ---
 class SpamPropagationDataset(Dataset):
     def __init__(self, df, tokenizer, user_map, biz_map, adj_matrix):
         self.df, self.tokenizer = df, tokenizer
@@ -167,9 +150,7 @@ class SpamPropagationDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         label = int(row['is_recommended'])
-
-        user_idx = self.user_map.get(row['author_name'], -1)
-        biz_idx = self.biz_map.get(row['biz_name'], -1)
+        user_idx, biz_idx = self.user_map.get(row['author_name'], -1), self.biz_map.get(row['biz_name'], -1)
 
         node_indices = []
         if user_idx != -1: node_indices.append(user_idx)
@@ -192,15 +173,13 @@ class SpamPropagationDataset(Dataset):
         edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous() if edge_list else torch.empty((2, 0),
                                                                                                               dtype=torch.long)
 
-        node_texts = []
-        timestamps = []
+        node_texts, timestamps = [], []
         for node_idx in subgraph_nodes:
-            if node_idx < len(self.user_map):  # 是用户
+            if node_idx < len(self.user_map):
                 user_name = list(self.user_map.keys())[list(self.user_map.values()).index(node_idx)]
                 node_texts.append(f"user: {user_name}")
-                # 简化：使用评论时间作为用户的激活时间
                 timestamps.append(pd.to_datetime(row['create_time']).timestamp())
-            else:  # 是商家
+            else:
                 biz_name = list(self.biz_map.keys())[list(self.biz_map.values()).index(node_idx - len(self.user_map))]
                 node_texts.append(f"business: {biz_name}")
                 timestamps.append(pd.to_datetime(row['create_time']).timestamp())
@@ -208,17 +187,15 @@ class SpamPropagationDataset(Dataset):
         node_inputs = self.tokenizer(node_texts, padding='max_length', max_length=32, truncation=True,
                                      return_tensors='pt')
 
-        graph_data = Data(
+        return Data(
             edge_index=edge_index,
             input_ids=node_inputs['input_ids'],
             attention_mask=node_inputs['attention_mask'],
             t=torch.tensor(timestamps, dtype=torch.float),
             y=torch.tensor(label, dtype=torch.long)
         )
-        return graph_data
 
 
-# --- 主执行块 ---
 if __name__ == '__main__':
     df = pd.read_csv(CONFIG["data_path"])
     df.dropna(subset=['content', 'author_name', 'biz_name', 'create_time'], inplace=True)
