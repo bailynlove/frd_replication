@@ -122,16 +122,34 @@ class HCMIN(nn.Module):
 
         # 2. 双重增强协同注意力
         # a. 模态内增强
-        enhanced_text = self.text_enhancement(text_feat, mask=(text_mask == 0))
+        # 对于文本，我们需要传递 mask 来忽略 padding tokens
+        text_padding_mask = (text_mask == 0)
+        enhanced_text = self.text_enhancement(text_feat, mask=text_padding_mask)
+        # 图像没有 padding，所以不需要 mask
         enhanced_image = self.image_enhancement(image_feat)
 
         # b. 模态间引导
-        fused_text = self.image_guided_co_attention(enhanced_text, enhanced_image, mask=(text_mask == 0))
-        fused_image = self.text_guided_co_attention(enhanced_image, enhanced_text)
+        # --- START OF FIX ---
+        # 当 key_value 是 enhanced_image 时，它没有padding，所以不传 mask
+        fused_text = self.image_guided_co_attention(enhanced_text, enhanced_image)
+
+        # 当 key_value 是 enhanced_text 时，它有padding，所以需要传递 text_padding_mask
+        fused_image = self.text_guided_co_attention(enhanced_image, enhanced_text, mask=text_padding_mask)
+        # --- END OF FIX ---
 
         # 3. 特征池化
-        pooled_enhanced_text = enhanced_text.mean(dim=1)
-        pooled_fused_text = fused_text.mean(dim=1)
+        # 注意：在池化时，需要考虑文本的padding，避免将padding部分计算在内
+        # 我们通过将padding位置的特征置零来实现
+        masked_enhanced_text = enhanced_text.masked_fill(text_padding_mask.unsqueeze(-1), 0)
+        masked_fused_text = fused_text.masked_fill(text_padding_mask.unsqueeze(-1), 0)
+
+        # 计算有效长度用于求平均
+        valid_lengths = text_mask.sum(dim=1, keepdim=True)
+
+        pooled_enhanced_text = masked_enhanced_text.sum(dim=1) / valid_lengths
+        pooled_fused_text = masked_fused_text.sum(dim=1) / valid_lengths
+
+        # 图像没有padding，直接求平均
         pooled_enhanced_image = enhanced_image.mean(dim=1)
         pooled_fused_image = fused_image.mean(dim=1)
 
@@ -142,7 +160,6 @@ class HCMIN(nn.Module):
         text_logits = self.text_classifier(text_branch_input)
         image_logits = self.image_classifier(image_branch_input)
 
-        # 返回用于计算不同损失的中间结果
         return text_logits, image_logits, pooled_enhanced_text, pooled_enhanced_image
 
 
