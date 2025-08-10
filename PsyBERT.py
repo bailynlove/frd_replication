@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertModel, BertTokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers import BertModel, BertTokenizer, get_linear_schedule_with_warmup
+from torch.optim import AdamW
 import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
