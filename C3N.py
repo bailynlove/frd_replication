@@ -28,7 +28,7 @@ CONFIG = {
     "data_path": "../spams_detection/spam_datasets/crawler/LA/outputs/full_data_0731_aug_4.csv",
     "image_dir": "../spams_detection/spam_datasets/crawler/LA/images/",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "epochs": 20,
+    "epochs": 0,
     "learning_rate": 1e-5,
     "clip_model": "openai/clip-vit-base-patch32",
     "num_nouns": 20,
