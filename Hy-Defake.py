@@ -47,8 +47,20 @@ class SpamHypergraphDataset(Dataset):
         """加载CSV并进行基本预处理"""
         print("Loading data...")
         df = pd.read_csv(data_path)
-        # 将 'is_recommended' 列转换为标签 (False -> 1 (虚假), True -> 0 (真实))
-        df['label'] = (~df['is_recommended']).astype(int)
+
+        # 模型需要: 真 -> 标签0, 假 -> 标签1
+        # 转换逻辑: label = 1 - is_recommended
+        df['label'] = 1 - df['is_recommended'].astype(int)
+
+        # 添加检查，确保标签只包含0和1
+        unique_labels = df['label'].unique()
+        print(f"Generated unique labels for the model: {unique_labels}")
+        if not all(label in [0, 1] for label in unique_labels):
+            print(
+                "\n!!! WARNING: Invalid labels generated! Please check the 'is_recommended' column in your CSV. It should only contain 0s and 1s. !!!\n")
+            # 如果标签有问题，可以抛出异常中断程序
+            raise ValueError("Invalid labels were created. Aborting.")
+
         # 填充用户特征中的NaN值
         user_feature_cols = ['author_friend_sum', 'author_review_sum', 'author_photo_sum']
         for col in user_feature_cols:
