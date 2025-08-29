@@ -80,7 +80,7 @@ def load_and_preprocess_data():
     df['processed_content'] = df['content'].apply(preprocess_text)
 
     # 用户特征处理
-    user_features = ['author_friend_sum', 'author_review_sum', 'author_photo_sum', 'author_char_id']
+    user_features = ['author_friend_sum', 'author_review_sum', 'author_photo_sum']
     user_feat_matrix = df[user_features].fillna(0).values
 
     # 标准化用户特征
