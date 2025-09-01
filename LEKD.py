@@ -765,7 +765,7 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
         lr=2e-5,
         weight_decay=1e-4
     )
-
+    last_lr = optimizer.param_groups[0]['lr']
     # 学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 'max', patience=2, factor=0.5
