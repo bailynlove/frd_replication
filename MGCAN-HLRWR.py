@@ -429,7 +429,8 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=20, threshold=1e-6):
 
     # 从图中获取预计算的转移矩阵
     P = G.graph['P']
-    num_nodes = G.graph['num_nodes']
+    # 修复：使用 G.number_of_nodes() 代替 G.graph['num_nodes']
+    num_nodes = G.number_of_nodes()
 
     # 初始化概率向量
     p = np.zeros(num_nodes)
@@ -474,7 +475,8 @@ def batch_rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10
     返回:
     - 邻接矩阵，仅包含采样的邻居
     """
-    num_nodes = G.graph['num_nodes']
+    # 修复：使用 G.number_of_nodes() 代替 G.graph['num_nodes']
+    num_nodes = G.number_of_nodes()
     adj = np.zeros((num_nodes, num_nodes))
 
     # 从图中获取预计算的转移矩阵
@@ -503,7 +505,6 @@ def batch_rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10
                 adj[neighbor, node_idx] = 1  # 无向图
 
     return adj
-
 
 def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10):
     """
