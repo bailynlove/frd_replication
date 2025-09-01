@@ -755,10 +755,13 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
         weight_decay=1e-4
     )
 
-    # 学习率调度器
+    # 学习率调度器 - 修复：移除verbose参数
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'max', patience=2, factor=0.5, verbose=True
+        optimizer, 'max', patience=2, factor=0.5
     )
+
+    # 初始化学习率记录，用于手动打印学习率变化
+    last_lr = optimizer.param_groups[0]['lr']
 
     # 训练参数
     num_epochs = 20
@@ -827,6 +830,12 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
 
         # 学习率调度
         scheduler.step(val_f1)
+
+        # 手动检查学习率是否降低并打印信息
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr < last_lr:
+            print(f"  学习率已降低到 {current_lr:.8f}")
+        last_lr = current_lr
 
         # 早停机制
         if val_f1 > best_val_f1:
