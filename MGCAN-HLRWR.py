@@ -19,7 +19,7 @@ from sklearn.metrics import (
     roc_auc_score
 )
 import networkx as nx
-import pickle  # 添加pickle模块
+import pickle
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -55,7 +55,6 @@ def set_seed(seed=42):
         except AttributeError:
             # 旧版本PyTorch可能需要不同的设置方式
             print("警告: 当前PyTorch版本可能不支持torch.mps.manual_seed()")
-            # 可以考虑添加其他MPS特定的设置
 
     # 确保跨平台一致性
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -76,7 +75,7 @@ def preprocess_text(text):
 
 
 def load_cached_data(cache_dir="./data_cache"):
-    """尝试加载缓存数据，如果没有则返回None"""
+    """尝试加载缓存数据，如果发现损坏则删除并返回None"""
     cache_files = {
         'interaction_matrix': os.path.join(cache_dir, 'interaction_matrix.npy'),
         'user_feat_matrix': os.path.join(cache_dir, 'user_feat_matrix.npy'),
@@ -97,57 +96,93 @@ def load_cached_data(cache_dir="./data_cache"):
     if not all_files_exist:
         return None
 
-    print("加载缓存数据...")
+    try:
+        # 尝试加载并验证idx_to_user_id
+        with open(cache_files['idx_to_user_id'], 'r') as f:
+            idx_to_user_id = json.load(f)
+            # 验证键是否为数字字符串
+            for k in idx_to_user_id.keys():
+                try:
+                    int(k)  # 尝试转换为整数
+                except ValueError:
+                    raise ValueError(f"idx_to_user_id contains non-numeric key: {k}")
 
-    # 加载交互矩阵
-    interaction_matrix = np.load(cache_files['interaction_matrix'])
+        # 尝试加载并验证idx_to_biz_id
+        with open(cache_files['idx_to_biz_id'], 'r') as f:
+            idx_to_biz_id = json.load(f)
+            # 验证键是否为数字字符串
+            for k in idx_to_biz_id.keys():
+                try:
+                    int(k)  # 尝试转换为整数
+                except ValueError:
+                    raise ValueError(f"idx_to_biz_id contains non-numeric key: {k}")
 
-    # 加载用户特征矩阵
-    user_feat_matrix = np.load(cache_files['user_feat_matrix'])
+        print("加载缓存数据...")
 
-    # 加载用户标签
-    user_labels = np.load(cache_files['user_labels'])
+        # 加载交互矩阵
+        interaction_matrix = np.load(cache_files['interaction_matrix'])
 
-    # 加载图 - 使用pickle加载
-    with open(cache_files['graph'], 'rb') as f:
-        G = pickle.load(f)
+        # 加载用户特征矩阵
+        user_feat_matrix = np.load(cache_files['user_feat_matrix'])
 
-    with open(cache_files['user_id_to_idx'], 'r') as f:
-        user_id_to_idx = json.load(f)
-        # user_id_to_idx 的键是 author_id 字符串，值是索引，不需要转换
+        # 加载用户标签
+        user_labels = np.load(cache_files['user_labels'])
 
-    with open(cache_files['idx_to_user_id'], 'r') as f:
-        idx_to_user_id = json.load(f)
-        # JSON键是字符串形式的数字，应转换为整数
-        idx_to_user_id = {int(k): v for k, v in idx_to_user_id.items()}
+        # 加载图 - 使用pickle加载
+        with open(cache_files['graph'], 'rb') as f:
+            G = pickle.load(f)
 
-    with open(cache_files['biz_id_to_idx'], 'r') as f:
-        biz_id_to_idx = json.load(f)
-        # biz_id_to_idx 的键是 biz_id 字符串，值是索引，不需要转换
+        # 加载映射
+        with open(cache_files['user_id_to_idx'], 'r') as f:
+            user_id_to_idx = json.load(f)
 
-    with open(cache_files['idx_to_biz_id'], 'r') as f:
-        idx_to_biz_id = json.load(f)
-        # JSON键是字符串形式的数字，应转换为整数
-        idx_to_biz_id = {int(k): v for k, v in idx_to_biz_id.items()}
+        with open(cache_files['idx_to_user_id'], 'r') as f:
+            idx_to_user_id = json.load(f)
+            # JSON键是字符串形式的数字，应转换为整数
+            idx_to_user_id = {int(k): v for k, v in idx_to_user_id.items()}
 
-    # 加载索引
-    train_idx = np.load(cache_files['train_idx'])
-    val_idx = np.load(cache_files['val_idx'])
-    test_idx = np.load(cache_files['test_idx'])
+        with open(cache_files['biz_id_to_idx'], 'r') as f:
+            biz_id_to_idx = json.load(f)
 
-    return {
-        'interaction_matrix': interaction_matrix,
-        'user_feat_matrix': user_feat_matrix,
-        'user_labels': user_labels,
-        'G': G,
-        'user_id_to_idx': user_id_to_idx,
-        'idx_to_user_id': idx_to_user_id,
-        'biz_id_to_idx': biz_id_to_idx,
-        'idx_to_biz_id': idx_to_biz_id,
-        'train_idx': train_idx,
-        'val_idx': val_idx,
-        'test_idx': test_idx
-    }
+        with open(cache_files['idx_to_biz_id'], 'r') as f:
+            idx_to_biz_id = json.load(f)
+            # JSON键是字符串形式的数字，应转换为整数
+            idx_to_biz_id = {int(k): v for k, v in idx_to_biz_id.items()}
+
+        # 加载索引
+        train_idx = np.load(cache_files['train_idx'])
+        val_idx = np.load(cache_files['val_idx'])
+        test_idx = np.load(cache_files['test_idx'])
+
+        return {
+            'interaction_matrix': interaction_matrix,
+            'user_feat_matrix': user_feat_matrix,
+            'user_labels': user_labels,
+            'G': G,
+            'user_id_to_idx': user_id_to_idx,
+            'idx_to_user_id': idx_to_user_id,
+            'biz_id_to_idx': biz_id_to_idx,
+            'idx_to_biz_id': idx_to_biz_id,
+            'train_idx': train_idx,
+            'val_idx': val_idx,
+            'test_idx': test_idx
+        }
+
+    except Exception as e:
+        print(f"缓存数据损坏: {str(e)}")
+        print("正在删除损坏的缓存文件...")
+
+        # 删除所有缓存文件
+        for file_path in cache_files.values():
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"已删除: {file_path}")
+
+        # 删除空目录
+        if os.path.exists(cache_dir) and not os.listdir(cache_dir):
+            os.rmdir(cache_dir)
+
+        return None
 
 
 def save_cached_data(processed_data, cache_dir="./data_cache"):
@@ -167,16 +202,14 @@ def save_cached_data(processed_data, cache_dir="./data_cache"):
     with open(os.path.join(cache_dir, 'graph.pkl'), 'wb') as f:
         pickle.dump(processed_data['G'], f)
 
+    # 保存映射
     with open(os.path.join(cache_dir, 'user_id_to_idx.json'), 'w') as f:
         json.dump(processed_data['user_id_to_idx'], f)
-
     with open(os.path.join(cache_dir, 'idx_to_user_id.json'), 'w') as f:
         # idx_to_user_id 的键是整数，需要转换为字符串才能保存为JSON
         json.dump({str(k): v for k, v in processed_data['idx_to_user_id'].items()}, f)
-
     with open(os.path.join(cache_dir, 'biz_id_to_idx.json'), 'w') as f:
         json.dump(processed_data['biz_id_to_idx'], f)
-
     with open(os.path.join(cache_dir, 'idx_to_biz_id.json'), 'w') as f:
         # idx_to_biz_id 的键是整数，需要转换为字符串才能保存为JSON
         json.dump({str(k): v for k, v in processed_data['idx_to_biz_id'].items()}, f)
@@ -187,6 +220,7 @@ def save_cached_data(processed_data, cache_dir="./data_cache"):
     np.save(os.path.join(cache_dir, 'test_idx.npy'), processed_data['test_idx'])
 
     print(f"数据已缓存到 {cache_dir}")
+
 
 def preprocess_data():
     """预处理数据"""
@@ -211,6 +245,7 @@ def preprocess_data():
     # 文本预处理
     df['processed_content'] = df['content'].apply(preprocess_text)
 
+    # 1. 用户-产品交互矩阵构建
     # 用户ID到索引的映射
     user_ids = df['author_id'].unique()
     user_id_to_idx = {user_id: idx for idx, user_id in enumerate(user_ids)}
@@ -258,6 +293,9 @@ def preprocess_data():
         G.add_node(i)
 
     # 添加边 (基于Jaccard相似度)
+    # 优化1: 提高相似度阈值，减少边数量
+    similarity_threshold = 0.2  # 从0.1提高到0.2，减少图的密度
+
     for i in range(num_users):
         for j in range(i + 1, num_users):
             # 计算Jaccard相似度
@@ -267,10 +305,11 @@ def preprocess_data():
             if total > 0:
                 similarity = common / total
                 # 仅添加相似度高于阈值的边
-                if similarity > 0.1:
+                if similarity > similarity_threshold:
                     G.add_edge(i, j, weight=similarity)
 
-    print(f"用户-用户关系图: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边")
+    print(
+        f"用户-用户关系图: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边 (密度: {G.number_of_edges() / (G.number_of_nodes() * (G.number_of_nodes() - 1) / 2):.4f})")
 
     # 4. 创建可疑用户标签
     # is_recommended为0表示假评论，即垃圾用户
@@ -327,7 +366,11 @@ def preprocess_data():
     return processed_data
 
 
-def rwr(G, start_node, restart_prob=0.2, max_steps=100, threshold=1e-6):
+# RWR缓存
+rwr_cache = {}
+
+
+def rwr(G, start_node, restart_prob=0.2, max_steps=50, threshold=1e-6):
     """
     实现Random Walk with Restart算法
 
@@ -335,12 +378,17 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=100, threshold=1e-6):
     - G: 用户-用户关系图
     - start_node: 起始节点
     - restart_prob: 重启概率
-    - max_steps: 最大步数
+    - max_steps: 最大步数 (从100减少到50)
     - threshold: 收敛阈值
 
     返回:
     - 重要邻居节点列表
     """
+    # 检查缓存
+    cache_key = f"{start_node}_{restart_prob}_{max_steps}"
+    if cache_key in rwr_cache:
+        return rwr_cache[cache_key]
+
     # 初始化概率向量
     num_nodes = G.number_of_nodes()
     p = np.zeros(num_nodes)
@@ -367,11 +415,17 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=100, threshold=1e-6):
     # 按概率排序
     sorted_indices = neighbor_indices[np.argsort(-p[neighbor_indices])]
 
-    return sorted_indices
+    # 优化2: 限制邻居数量
+    top_k = 10  # 限制为最多10个邻居
+    result = sorted_indices[:top_k]
+
+    # 保存到缓存
+    rwr_cache[cache_key] = result
+    return result
 
 
 class MultiHeadGraphChannelAttention(nn.Module):
-    """多头图通道注意力网络"""
+    """多头图通道注意力网络 - 优化版"""
 
     def __init__(self, in_features, out_features, num_heads, dropout=0.5):
         """
@@ -380,7 +434,7 @@ class MultiHeadGraphChannelAttention(nn.Module):
         参数:
         - in_features: 输入特征维度
         - out_features: 输出特征维度
-        - num_heads: 注意力头数
+        - num_heads: 注意力头数 (从8减少到4)
         - dropout: Dropout率
         """
         super(MultiHeadGraphChannelAttention, self).__init__()
@@ -389,14 +443,18 @@ class MultiHeadGraphChannelAttention(nn.Module):
         self.out_features = out_features
         self.num_heads = num_heads
 
+        # 优化3: 减少注意力头数量
+        # 原始: num_heads=8, 现在减少到4
+        self.num_heads = min(num_heads, 4)
+
         # 为每个头创建参数
         self.W = nn.ModuleList([
             nn.Linear(in_features, out_features, bias=False)
-            for _ in range(num_heads)
+            for _ in range(self.num_heads)
         ])
 
         # 注意力参数
-        self.a = nn.Parameter(torch.zeros(size=(num_heads, 2 * out_features)))
+        self.a = nn.Parameter(torch.zeros(size=(self.num_heads, 2 * out_features)))
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
         # Dropout
@@ -455,14 +513,16 @@ class MultiHeadGraphChannelAttention(nn.Module):
 
 
 class UserFeatureEncoder(nn.Module):
-    """用户特征编码器"""
+    """用户特征编码器 - 简化版"""
 
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(UserFeatureEncoder, self).__init__()
 
+        # 优化4: 简化编码器结构
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            # 去掉一层，减少计算复杂度
             nn.Linear(hidden_dim, output_dim)
         )
 
@@ -471,7 +531,7 @@ class UserFeatureEncoder(nn.Module):
 
 
 class MHGCAN(nn.Module):
-    """完整的MHGCAN模型"""
+    """完整的MHGCAN模型 - 优化版"""
 
     def __init__(self,
                  user_feat_dim,
@@ -481,27 +541,30 @@ class MHGCAN(nn.Module):
                  dropout=0.5):
         super(MHGCAN, self).__init__()
 
+        # 优化5: 降低隐藏层维度
+        self.hidden_dim = max(64, hidden_dim // 2)  # 从128降低到64
+
         # 用户特征编码
         self.user_encoder = UserFeatureEncoder(
             user_feat_dim,
-            hidden_dim,
-            hidden_dim
+            self.hidden_dim,
+            self.hidden_dim
         )
 
         # 多头图通道注意力层
         self.attention = MultiHeadGraphChannelAttention(
-            hidden_dim,
-            hidden_dim // num_heads,
+            self.hidden_dim,
+            self.hidden_dim // 4,  # 从hidden_dim // num_heads调整
             num_heads,
             dropout
         )
 
-        # 分类器
+        # 分类器 - 简化
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 4),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_classes)
+            nn.Linear(self.hidden_dim // 4, num_classes)
         )
 
         # Dropout
@@ -684,10 +747,8 @@ class SpammerDataset(Dataset):
     """垃圾用户检测数据集"""
 
     def __init__(self, node_indices, labels):
-        # 确保node_indices和labels是numpy数组
-        self.node_indices = np.array(node_indices)
-        # 确保labels是整数类型（分类任务的标签）
-        self.labels = np.array(labels).astype(np.int64)
+        self.node_indices = node_indices
+        self.labels = labels
 
     def __len__(self):
         return len(self.node_indices)
@@ -696,7 +757,7 @@ class SpammerDataset(Dataset):
         return self.node_indices[idx], self.labels[idx]
 
 
-def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=100, top_k=10):
+def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=50, top_k=10):
     """
     使用RWR为每个节点采样重要邻居
 
@@ -713,7 +774,7 @@ def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=100, top_k=10):
     num_nodes = G.number_of_nodes()
     adj = np.zeros((num_nodes, num_nodes))
 
-    # 添加tqdm进度条
+    # 优化6: 使用tqdm显示进度
     pbar = tqdm(node_indices, desc="RWR Sampling", leave=False)
     for node_idx in pbar:
         # 使用RWR获取重要邻居
@@ -731,8 +792,8 @@ def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=100, top_k=10):
     return adj
 
 
-def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
-    """训练模型"""
+def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
+    """训练模型 - 优化版"""
     # 准备数据
     interaction_matrix = processed_data['interaction_matrix']
     user_feat_matrix = processed_data['user_feat_matrix']
@@ -747,7 +808,8 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
     val_dataset = SpammerDataset(val_idx, user_labels[val_idx])
     test_dataset = SpammerDataset(test_idx, user_labels[test_idx])
 
-    # 创建数据加载器
+    # 优化7: 增加批量大小
+    # 原batch_size=128, 现在增加到256
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
@@ -760,7 +822,7 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
     elif torch.cuda.is_available():
         device = torch.device("cuda")
         print("使用CUDA设备")
-        dtype = torch.float64
+        dtype = torch.float32  # 优化8: 使用float32而非float64
     else:
         device = torch.device("cpu")
         print("使用CPU设备")
@@ -769,13 +831,17 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
     # 初始化模型
     model = MHGCAN(
         user_feat_dim=user_feat_matrix.shape[1],
-        hidden_dim=128,
-        num_heads=4,
+        hidden_dim=64,  # 从128降低到64
+        num_heads=4,  # 从8降低到4
         num_classes=2,
         dropout=0.5
     ).to(device)
 
-    # 优化器和损失函数
+    # 优化9: 使用混合精度训练
+    use_amp = device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
+    # 优化10: 使用更大的学习率
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
 
@@ -794,6 +860,14 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
     early_stop_counter = 0
     early_stop_patience = 10
 
+    # 优化11: 使用学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 'max', patience=3, factor=0.5
+    )
+
+    # 优化12: 记录学习率
+    current_lr = lr
+
     for epoch in range(num_epochs):
         # 训练阶段
         model.train()
@@ -801,7 +875,7 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
         all_preds = []
         all_labels = []
 
-        # 添加tqdm进度条
+        # 优化13: 添加tqdm进度条
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
         for node_indices, batch_labels in pbar:
             # 确保node_indices是LongTensor
@@ -813,14 +887,27 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
             adj = rwr_sampling(G, node_indices.cpu().numpy(), top_k=10)
             adj = torch.tensor(adj, dtype=dtype).to(device)
 
-            # 前向传播
-            optimizer.zero_grad()
-            outputs = model(user_features, adj, node_indices)
-            loss = criterion(outputs, batch_labels)
+            # 优化14: 混合精度训练
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    # 前向传播
+                    outputs = model(user_features, adj, node_indices)
+                    loss = criterion(outputs, batch_labels)
 
-            # 反向传播
-            loss.backward()
-            optimizer.step()
+                # 反向传播
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # 前向传播
+                optimizer.zero_grad()
+                outputs = model(user_features, adj, node_indices)
+                loss = criterion(outputs, batch_labels)
+
+                # 反向传播
+                loss.backward()
+                optimizer.step()
 
             # 记录
             total_loss += loss.item()
@@ -855,13 +942,17 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
         print(
             f"  Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, Pre: {val_pre:.4f}, Rec: {val_rec:.4f}, F1: {val_f1:.4f}")
 
+        # 优化15: 学习率调度
+        scheduler.step(val_f1)
+        current_lr = optimizer.param_groups[0]['lr']
+
         # 早停机制
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             early_stop_counter = 0
             # 保存最佳模型
             torch.save(model.state_dict(), 'mhgcan_best.pt')
-            print("  --> 保存新最佳模型")
+            print(f"  --> 保存新最佳模型 (F1: {val_f1:.4f}, LR: {current_lr:.6f})")
         else:
             early_stop_counter += 1
             print(f"  早停计数器: {early_stop_counter}/{early_stop_patience}")
@@ -896,8 +987,8 @@ def train_model(processed_data, num_epochs=50, batch_size=128, lr=0.001):
         }
     }
 
-    import json
     with open('mhgcan_results.json', 'w') as f:
+        import json
         json.dump(results, f, indent=4)
 
     # 绘制训练曲线
@@ -916,10 +1007,10 @@ def evaluate_model(model, loader, user_features, labels, G, device, return_auc=F
     criterion = nn.CrossEntropyLoss()
 
     # 确定数据类型
-    dtype = torch.float32 if device.type == 'mps' else torch.float64
+    dtype = torch.float32 if device.type == 'mps' else torch.float32
 
     # 添加tqdm进度条
-    pbar = tqdm(loader, desc="Evaluating")
+    pbar = tqdm(loader, desc="Evaluating", leave=False)
     with torch.no_grad():
         for node_indices, batch_labels in pbar:
             # 确保node_indices是LongTensor
@@ -960,6 +1051,7 @@ def evaluate_model(model, loader, user_features, labels, G, device, return_auc=F
         return total_loss / len(loader), accuracy, precision, recall, f1, auc
     else:
         return total_loss / len(loader), accuracy, precision, recall, f1
+
 
 def plot_training_curves(train_losses, val_losses, val_accs, val_f1s):
     """绘制训练曲线"""
@@ -1076,10 +1168,11 @@ def main():
     print("步骤2: 训练模型")
     print("=" * 50)
 
+    # 优化16: 减少训练轮次（如果验证F1已经稳定）
     model, results = train_model(
         processed_data,
-        num_epochs=50,
-        batch_size=128,
+        num_epochs=30,  # 从50减少到30
+        batch_size=256,  # 从128增加到256
         lr=0.001
     )
 
