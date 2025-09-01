@@ -296,20 +296,58 @@ def preprocess_data():
     # 优化1: 提高相似度阈值，减少边数量
     similarity_threshold = 0.2  # 从0.1提高到0.2，减少图的密度
 
+    print(f"开始构建用户-用户关系图 (相似度阈值: {similarity_threshold})...")
+    start_time = time.time()
+
+    # 优化2: 使用更高效的相似度计算方法
+    # 创建交互矩阵的稀疏表示
+    from scipy.sparse import csr_matrix
+    interaction_sparse = csr_matrix(interaction_matrix)
+
+    # 计算Jaccard相似度矩阵
+    intersection = interaction_sparse @ interaction_sparse.T
+    row_sum = np.array(interaction_sparse.sum(axis=1)).flatten()
+    union = row_sum[:, np.newaxis] + row_sum - intersection.toarray()
+
+    # 避免除以0
+    union[union == 0] = 1
+
+    # 计算相似度
+    similarity = intersection.toarray() / union
+
+    # 添加边
     for i in range(num_users):
         for j in range(i + 1, num_users):
-            # 计算Jaccard相似度
-            common = np.sum(interaction_matrix[i] * interaction_matrix[j])
-            total = np.sum(
-                interaction_matrix[i] + interaction_matrix[j] - interaction_matrix[i] * interaction_matrix[j])
-            if total > 0:
-                similarity = common / total
-                # 仅添加相似度高于阈值的边
-                if similarity > similarity_threshold:
-                    G.add_edge(i, j, weight=similarity)
+            if similarity[i, j] > similarity_threshold:
+                G.add_edge(i, j, weight=similarity[i, j])
 
+    print(f"用户-用户关系图构建完成，耗时: {time.time() - start_time:.2f}秒")
     print(
         f"用户-用户关系图: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边 (密度: {G.number_of_edges() / (G.number_of_nodes() * (G.number_of_nodes() - 1) / 2):.4f})")
+
+    # === 关键优化3: 预计算RWR转移矩阵 ===
+    print("预计算RWR转移矩阵...")
+    start_time = time.time()
+
+    # 使用稀疏矩阵表示（大幅提高效率）
+    from scipy import sparse
+
+    # 创建邻接矩阵（稀疏格式）
+    adj_matrix = nx.to_scipy_sparse_array(G, format='csr')
+
+    # 计算度矩阵的逆
+    degrees = np.array(adj_matrix.sum(axis=1)).flatten()
+    degrees[degrees == 0] = 1  # 避免除以0
+    D_inv = sparse.diags(1.0 / degrees)
+
+    # 计算转移矩阵 P = D^-1 * A
+    P = D_inv @ adj_matrix
+
+    # 保存到图对象
+    G.graph['P'] = P
+    G.graph['num_nodes'] = num_users
+
+    print(f"转移矩阵预计算完成，耗时: {time.time() - start_time:.2f}秒")
 
     # 4. 创建可疑用户标签
     # is_recommended为0表示假评论，即垃圾用户
@@ -370,15 +408,15 @@ def preprocess_data():
 rwr_cache = {}
 
 
-def rwr(G, start_node, restart_prob=0.2, max_steps=50, threshold=1e-6):
+def rwr(G, start_node, restart_prob=0.2, max_steps=20, threshold=1e-6):
     """
-    实现Random Walk with Restart算法
+    优化版RWR实现
 
     参数:
-    - G: 用户-用户关系图
+    - G: 用户-用户关系图（已预计算转移矩阵）
     - start_node: 起始节点
     - restart_prob: 重启概率
-    - max_steps: 最大步数 (从100减少到50)
+    - max_steps: 最大步数（从50减少到20）
     - threshold: 收敛阈值
 
     返回:
@@ -389,20 +427,18 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=50, threshold=1e-6):
     if cache_key in rwr_cache:
         return rwr_cache[cache_key]
 
+    # 从图中获取预计算的转移矩阵
+    P = G.graph['P']
+    num_nodes = G.graph['num_nodes']
+
     # 初始化概率向量
-    num_nodes = G.number_of_nodes()
     p = np.zeros(num_nodes)
     p[start_node] = 1.0
 
-    # 获取邻接矩阵
-    A = nx.to_numpy_array(G)
-    # 归一化为转移矩阵
-    D = np.diag(1.0 / np.sum(A, axis=1))
-    P = np.dot(D, A)
-
     # RWR迭代
     for _ in range(max_steps):
-        p_new = (1 - restart_prob) * np.dot(P, p) + restart_prob * (np.arange(num_nodes) == start_node).astype(float)
+        # 使用稀疏矩阵乘法
+        p_new = (1 - restart_prob) * P.dot(p) + restart_prob * (np.arange(num_nodes) == start_node).astype(float)
 
         # 检查收敛
         if np.max(np.abs(p_new - p)) < threshold:
@@ -415,13 +451,76 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=50, threshold=1e-6):
     # 按概率排序
     sorted_indices = neighbor_indices[np.argsort(-p[neighbor_indices])]
 
-    # 优化2: 限制邻居数量
+    # 限制邻居数量
     top_k = 10  # 限制为最多10个邻居
     result = sorted_indices[:top_k]
 
     # 保存到缓存
     rwr_cache[cache_key] = result
     return result
+
+
+def batch_rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10):
+    """
+    批量RWR采样 - 一次性处理多个节点
+
+    参数:
+    - G: 用户-用户关系图
+    - node_indices: 节点索引列表
+    - restart_prob: 重启概率
+    - max_steps: 最大步数
+    - top_k: 采样邻居数量
+
+    返回:
+    - 邻接矩阵，仅包含采样的邻居
+    """
+    num_nodes = G.graph['num_nodes']
+    adj = np.zeros((num_nodes, num_nodes))
+
+    # 从图中获取预计算的转移矩阵
+    P = G.graph['P']
+
+    # 批量处理
+    p_batch = np.zeros((len(node_indices), num_nodes))
+    for i, node_idx in enumerate(node_indices):
+        p = np.zeros(num_nodes)
+        p[node_idx] = 1.0
+        p_batch[i] = p
+
+    # 批量RWR迭代
+    for _ in range(max_steps):
+        p_batch = (1 - restart_prob) * p_batch @ P.toarray() + restart_prob * np.eye(num_nodes)[node_indices]
+
+    # 构建采样邻接矩阵
+    for i, node_idx in enumerate(node_indices):
+        # 获取重要邻居
+        neighbor_indices = np.argsort(-p_batch[i])[:top_k]
+
+        # 仅保留top_k邻居（排除自身）
+        for neighbor in neighbor_indices:
+            if neighbor != node_idx:
+                adj[node_idx, neighbor] = 1
+                adj[neighbor, node_idx] = 1  # 无向图
+
+    return adj
+
+
+def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10):
+    """
+    使用RWR为每个节点采样重要邻居
+
+    参数:
+    - G: 用户-用户关系图
+    - node_indices: 节点索引列表
+    - restart_prob: 重启概率
+    - max_steps: 最大步数
+    - top_k: 采样邻居数量
+
+    返回:
+    - 邻接矩阵，仅包含采样的邻居
+    """
+    # 使用批量RWR采样
+    return batch_rwr_sampling(G, node_indices, restart_prob, max_steps, top_k)
 
 
 class MultiHeadGraphChannelAttention(nn.Module):
@@ -443,7 +542,7 @@ class MultiHeadGraphChannelAttention(nn.Module):
         self.out_features = out_features
         self.num_heads = num_heads
 
-        # 优化3: 减少注意力头数量
+        # 优化: 减少注意力头数量
         # 原始: num_heads=8, 现在减少到4
         self.num_heads = min(num_heads, 4)
 
@@ -518,7 +617,7 @@ class UserFeatureEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(UserFeatureEncoder, self).__init__()
 
-        # 优化4: 简化编码器结构
+        # 优化: 简化编码器结构
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -541,7 +640,7 @@ class MHGCAN(nn.Module):
                  dropout=0.5):
         super(MHGCAN, self).__init__()
 
-        # 优化5: 降低隐藏层维度
+        # 优化: 降低隐藏层维度
         self.hidden_dim = max(64, hidden_dim // 2)  # 从128降低到64
 
         # 用户特征编码
@@ -757,42 +856,7 @@ class SpammerDataset(Dataset):
         return self.node_indices[idx], self.labels[idx]
 
 
-def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=50, top_k=10):
-    """
-    使用RWR为每个节点采样重要邻居
-
-    参数:
-    - G: 用户-用户关系图
-    - node_indices: 节点索引列表
-    - restart_prob: 重启概率
-    - max_steps: 最大步数
-    - top_k: 采样邻居数量
-
-    返回:
-    - 邻接矩阵，仅包含采样的邻居
-    """
-    num_nodes = G.number_of_nodes()
-    adj = np.zeros((num_nodes, num_nodes))
-
-    # 优化6: 使用tqdm显示进度
-    pbar = tqdm(node_indices, desc="RWR Sampling", leave=False)
-    for node_idx in pbar:
-        # 使用RWR获取重要邻居
-        neighbors = rwr(G, node_idx, restart_prob, max_steps)
-
-        # 仅保留top_k邻居
-        for neighbor in neighbors[:top_k]:
-            if neighbor != node_idx:  # 排除自身
-                adj[node_idx, neighbor] = 1
-                adj[neighbor, node_idx] = 1  # 无向图
-
-        # 更新进度条
-        pbar.set_postfix({"neighbors": len(neighbors[:top_k])})
-
-    return adj
-
-
-def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
+def train_model(processed_data, num_epochs=30, batch_size=256, lr=0.001):
     """训练模型 - 优化版"""
     # 准备数据
     interaction_matrix = processed_data['interaction_matrix']
@@ -808,7 +872,7 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
     val_dataset = SpammerDataset(val_idx, user_labels[val_idx])
     test_dataset = SpammerDataset(test_idx, user_labels[test_idx])
 
-    # 优化7: 增加批量大小
+    # 优化: 增加批量大小
     # 原batch_size=128, 现在增加到256
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
@@ -822,7 +886,7 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
     elif torch.cuda.is_available():
         device = torch.device("cuda")
         print("使用CUDA设备")
-        dtype = torch.float32  # 优化8: 使用float32而非float64
+        dtype = torch.float32  # 优化: 使用float32而非float64
     else:
         device = torch.device("cpu")
         print("使用CPU设备")
@@ -837,11 +901,11 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
         dropout=0.5
     ).to(device)
 
-    # 优化9: 使用混合精度训练
+    # 优化: 使用混合精度训练
     use_amp = device.type == 'cuda'
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-    # 优化10: 使用更大的学习率
+    # 优化: 使用更大的学习率
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
 
@@ -860,13 +924,29 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
     early_stop_counter = 0
     early_stop_patience = 10
 
-    # 优化11: 使用学习率调度器
+    # 优化: 使用学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 'max', patience=3, factor=0.5
     )
 
-    # 优化12: 记录学习率
+    # 优化: 记录学习率
     current_lr = lr
+
+    # 优化: 预计算所有可能需要的RWR结果（如果内存允许）
+    if len(G.nodes) < 10000:  # 对小图预计算
+        print("预计算所有节点的RWR结果...")
+        start_time = time.time()
+
+        # 创建完整的采样邻接矩阵
+        full_adj = batch_rwr_sampling(
+            G,
+            list(range(len(G.nodes))),
+            top_k=10
+        )
+
+        # 保存到处理数据中
+        processed_data['full_rwr_adj'] = full_adj
+        print(f"RWR预计算完成，耗时: {time.time() - start_time:.2f}秒")
 
     for epoch in range(num_epochs):
         # 训练阶段
@@ -875,7 +955,7 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
         all_preds = []
         all_labels = []
 
-        # 优化13: 添加tqdm进度条
+        # 优化: 添加tqdm进度条
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
         for node_indices, batch_labels in pbar:
             # 确保node_indices是LongTensor
@@ -883,11 +963,18 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
             # 确保batch_labels是LongTensor
             batch_labels = batch_labels.long().to(device)
 
-            # RWR采样邻居并构建子图
-            adj = rwr_sampling(G, node_indices.cpu().numpy(), top_k=10)
-            adj = torch.tensor(adj, dtype=dtype).to(device)
+            # 优化: 使用预计算的RWR结果（如果可用）
+            if 'full_rwr_adj' in processed_data:
+                adj = torch.tensor(
+                    processed_data['full_rwr_adj'][node_indices][:, node_indices],
+                    dtype=dtype
+                ).to(device)
+            else:
+                # RWR采样邻居并构建子图
+                adj = rwr_sampling(G, node_indices.cpu().numpy(), top_k=10)
+                adj = torch.tensor(adj, dtype=dtype).to(device)
 
-            # 优化14: 混合精度训练
+            # 优化: 混合精度训练
             if use_amp:
                 with torch.cuda.amp.autocast():
                     # 前向传播
@@ -942,7 +1029,7 @@ def train_model(processed_data, num_epochs=50, batch_size=256, lr=0.001):
         print(
             f"  Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, Pre: {val_pre:.4f}, Rec: {val_rec:.4f}, F1: {val_f1:.4f}")
 
-        # 优化15: 学习率调度
+        # 优化: 学习率调度
         scheduler.step(val_f1)
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -1018,9 +1105,16 @@ def evaluate_model(model, loader, user_features, labels, G, device, return_auc=F
             # 确保batch_labels是LongTensor
             batch_labels = batch_labels.long().to(device)
 
-            # RWR采样邻居并构建子图
-            adj = rwr_sampling(G, node_indices.cpu().numpy(), top_k=10)
-            adj = torch.tensor(adj, dtype=dtype).to(device)
+            # 优化: 使用预计算的RWR结果（如果可用）
+            if hasattr(G, 'full_rwr_adj'):
+                adj = torch.tensor(
+                    G.full_rwr_adj[node_indices][:, node_indices],
+                    dtype=dtype
+                ).to(device)
+            else:
+                # RWR采样邻居并构建子图
+                adj = rwr_sampling(G, node_indices.cpu().numpy(), top_k=10)
+                adj = torch.tensor(adj, dtype=dtype).to(device)
 
             # 前向传播
             outputs = model(user_features, adj, node_indices)
@@ -1168,7 +1262,7 @@ def main():
     print("步骤2: 训练模型")
     print("=" * 50)
 
-    # 优化16: 减少训练轮次（如果验证F1已经稳定）
+    # 优化: 减少训练轮次（如果验证F1已经稳定）
     model, results = train_model(
         processed_data,
         num_epochs=30,  # 从50减少到30
