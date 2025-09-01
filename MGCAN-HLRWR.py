@@ -1313,7 +1313,7 @@ def main():
     model, results = train_model(
         processed_data,
         num_epochs=5,  # 从50减少到30
-        batch_size=64,  # 从128增加到256
+        batch_size=512,  # 从128增加到256
         lr=0.001
     )
 
