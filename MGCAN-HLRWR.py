@@ -1312,8 +1312,8 @@ def main():
     # 优化: 减少训练轮次（如果验证F1已经稳定）
     model, results = train_model(
         processed_data,
-        num_epochs=30,  # 从50减少到30
-        batch_size=256,  # 从128增加到256
+        num_epochs=5,  # 从50减少到30
+        batch_size=64,  # 从128增加到256
         lr=0.001
     )
 
