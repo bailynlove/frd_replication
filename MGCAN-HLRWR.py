@@ -74,6 +74,52 @@ def preprocess_text(text):
     return text
 
 
+def save_cached_data(processed_data, cache_dir="./data_cache"):
+    """保存处理后的数据到缓存"""
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # 保存交互矩阵
+    np.save(os.path.join(cache_dir, 'interaction_matrix.npy'), processed_data['interaction_matrix'])
+
+    # 保存用户特征矩阵
+    np.save(os.path.join(cache_dir, 'user_feat_matrix.npy'), processed_data['user_feat_matrix'])
+
+    # 保存用户标签
+    np.save(os.path.join(cache_dir, 'user_labels.npy'), processed_data['user_labels'])
+
+    # 保存图 - 使用pickle保存
+    G = processed_data['G']
+
+    # 临时保存转移矩阵到单独的文件
+    if 'P' in G.graph:
+        with open(os.path.join(cache_dir, 'graph_P.pkl'), 'wb') as f:
+            pickle.dump(G.graph['P'], f)
+        # 从G.graph中移除P，因为它可能无法正确pickle
+        del G.graph['P']
+
+    with open(os.path.join(cache_dir, 'graph.pkl'), 'wb') as f:
+        pickle.dump(G, f)
+
+    # 保存映射
+    with open(os.path.join(cache_dir, 'user_id_to_idx.json'), 'w') as f:
+        json.dump(processed_data['user_id_to_idx'], f)
+    with open(os.path.join(cache_dir, 'idx_to_user_id.json'), 'w') as f:
+        # idx_to_user_id 的键是整数，需要转换为字符串才能保存为JSON
+        json.dump({str(k): v for k, v in processed_data['idx_to_user_id'].items()}, f)
+    with open(os.path.join(cache_dir, 'biz_id_to_idx.json'), 'w') as f:
+        json.dump(processed_data['biz_id_to_idx'], f)
+    with open(os.path.join(cache_dir, 'idx_to_biz_id.json'), 'w') as f:
+        # idx_to_biz_id 的键是整数，需要转换为字符串才能保存为JSON
+        json.dump({str(k): v for k, v in processed_data['idx_to_biz_id'].items()}, f)
+
+    # 保存索引
+    np.save(os.path.join(cache_dir, 'train_idx.npy'), processed_data['train_idx'])
+    np.save(os.path.join(cache_dir, 'val_idx.npy'), processed_data['val_idx'])
+    np.save(os.path.join(cache_dir, 'test_idx.npy'), processed_data['test_idx'])
+
+    print(f"数据已缓存到 {cache_dir}")
+
+
 def load_cached_data(cache_dir="./data_cache"):
     """尝试加载缓存数据，如果发现损坏则删除并返回None"""
     cache_files = {
@@ -132,6 +178,22 @@ def load_cached_data(cache_dir="./data_cache"):
         with open(cache_files['graph'], 'rb') as f:
             G = pickle.load(f)
 
+        # 重新加载转移矩阵
+        P_file = os.path.join(cache_dir, 'graph_P.pkl')
+        if os.path.exists(P_file):
+            with open(P_file, 'rb') as f:
+                G.graph['P'] = pickle.load(f)
+        else:
+            # 如果没有P文件，可能是旧缓存，需要重新计算
+            print("警告: 未找到转移矩阵P，需要重新计算...")
+            from scipy import sparse
+            adj_matrix = nx.to_scipy_sparse_array(G, format='csr')
+            degrees = np.array(adj_matrix.sum(axis=1)).flatten()
+            degrees[degrees == 0] = 1
+            D_inv = sparse.diags(1.0 / degrees)
+            P = D_inv @ adj_matrix
+            G.graph['P'] = P
+
         # 加载映射
         with open(cache_files['user_id_to_idx'], 'r') as f:
             user_id_to_idx = json.load(f)
@@ -183,43 +245,6 @@ def load_cached_data(cache_dir="./data_cache"):
             os.rmdir(cache_dir)
 
         return None
-
-
-def save_cached_data(processed_data, cache_dir="./data_cache"):
-    """保存处理后的数据到缓存"""
-    os.makedirs(cache_dir, exist_ok=True)
-
-    # 保存交互矩阵
-    np.save(os.path.join(cache_dir, 'interaction_matrix.npy'), processed_data['interaction_matrix'])
-
-    # 保存用户特征矩阵
-    np.save(os.path.join(cache_dir, 'user_feat_matrix.npy'), processed_data['user_feat_matrix'])
-
-    # 保存用户标签
-    np.save(os.path.join(cache_dir, 'user_labels.npy'), processed_data['user_labels'])
-
-    # 保存图 - 使用pickle保存
-    with open(os.path.join(cache_dir, 'graph.pkl'), 'wb') as f:
-        pickle.dump(processed_data['G'], f)
-
-    # 保存映射
-    with open(os.path.join(cache_dir, 'user_id_to_idx.json'), 'w') as f:
-        json.dump(processed_data['user_id_to_idx'], f)
-    with open(os.path.join(cache_dir, 'idx_to_user_id.json'), 'w') as f:
-        # idx_to_user_id 的键是整数，需要转换为字符串才能保存为JSON
-        json.dump({str(k): v for k, v in processed_data['idx_to_user_id'].items()}, f)
-    with open(os.path.join(cache_dir, 'biz_id_to_idx.json'), 'w') as f:
-        json.dump(processed_data['biz_id_to_idx'], f)
-    with open(os.path.join(cache_dir, 'idx_to_biz_id.json'), 'w') as f:
-        # idx_to_biz_id 的键是整数，需要转换为字符串才能保存为JSON
-        json.dump({str(k): v for k, v in processed_data['idx_to_biz_id'].items()}, f)
-
-    # 保存索引
-    np.save(os.path.join(cache_dir, 'train_idx.npy'), processed_data['train_idx'])
-    np.save(os.path.join(cache_dir, 'val_idx.npy'), processed_data['val_idx'])
-    np.save(os.path.join(cache_dir, 'test_idx.npy'), processed_data['test_idx'])
-
-    print(f"数据已缓存到 {cache_dir}")
 
 
 def preprocess_data():
@@ -345,7 +370,7 @@ def preprocess_data():
 
     # 保存到图对象
     G.graph['P'] = P
-    G.graph['num_nodes'] = num_users
+    # 不再需要单独保存 num_nodes，因为可以使用 G.number_of_nodes()
 
     print(f"转移矩阵预计算完成，耗时: {time.time() - start_time:.2f}秒")
 
@@ -408,6 +433,62 @@ def preprocess_data():
 rwr_cache = {}
 
 
+def batch_rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10):
+    """
+    批量RWR采样 - 一次性处理多个节点
+
+    参数:
+    - G: 用户-用户关系图
+    - node_indices: 节点索引列表
+    - restart_prob: 重启概率
+    - max_steps: 最大步数
+    - top_k: 采样邻居数量
+
+    返回:
+    - 邻接矩阵，仅包含采样的邻居
+    """
+    num_nodes = G.number_of_nodes()
+    adj = np.zeros((num_nodes, num_nodes))
+
+    # 从图中获取预计算的转移矩阵
+    if 'P' in G.graph:
+        P = G.graph['P']
+    else:
+        # 如果P不存在，可能是旧缓存，需要重新计算
+        print("警告: 转移矩阵P不存在，需要重新计算...")
+        from scipy import sparse
+        adj_matrix = nx.to_scipy_sparse_array(G, format='csr')
+        degrees = np.array(adj_matrix.sum(axis=1)).flatten()
+        degrees[degrees == 0] = 1
+        D_inv = sparse.diags(1.0 / degrees)
+        P = D_inv @ adj_matrix
+        G.graph['P'] = P
+
+    # 批量处理
+    p_batch = np.zeros((len(node_indices), num_nodes))
+    for i, node_idx in enumerate(node_indices):
+        p = np.zeros(num_nodes)
+        p[node_idx] = 1.0
+        p_batch[i] = p
+
+    # 批量RWR迭代
+    for _ in range(max_steps):
+        p_batch = (1 - restart_prob) * p_batch @ P.toarray() + restart_prob * np.eye(num_nodes)[node_indices]
+
+    # 构建采样邻接矩阵
+    for i, node_idx in enumerate(node_indices):
+        # 获取重要邻居
+        neighbor_indices = np.argsort(-p_batch[i])[:top_k]
+
+        # 仅保留top_k邻居（排除自身）
+        for neighbor in neighbor_indices:
+            if neighbor != node_idx:
+                adj[node_idx, neighbor] = 1
+                adj[neighbor, node_idx] = 1  # 无向图
+
+    return adj
+
+
 def rwr(G, start_node, restart_prob=0.2, max_steps=20, threshold=1e-6):
     """
     优化版RWR实现
@@ -428,8 +509,19 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=20, threshold=1e-6):
         return rwr_cache[cache_key]
 
     # 从图中获取预计算的转移矩阵
-    P = G.graph['P']
-    # 修复：使用 G.number_of_nodes() 代替 G.graph['num_nodes']
+    if 'P' in G.graph:
+        P = G.graph['P']
+    else:
+        # 如果P不存在，可能是旧缓存，需要重新计算
+        print(f"警告: 转移矩阵P不存在，需要重新计算 (节点 {start_node})...")
+        from scipy import sparse
+        adj_matrix = nx.to_scipy_sparse_array(G, format='csr')
+        degrees = np.array(adj_matrix.sum(axis=1)).flatten()
+        degrees[degrees == 0] = 1
+        D_inv = sparse.diags(1.0 / degrees)
+        P = D_inv @ adj_matrix
+        G.graph['P'] = P
+
     num_nodes = G.number_of_nodes()
 
     # 初始化概率向量
@@ -459,52 +551,6 @@ def rwr(G, start_node, restart_prob=0.2, max_steps=20, threshold=1e-6):
     # 保存到缓存
     rwr_cache[cache_key] = result
     return result
-
-
-def batch_rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10):
-    """
-    批量RWR采样 - 一次性处理多个节点
-
-    参数:
-    - G: 用户-用户关系图
-    - node_indices: 节点索引列表
-    - restart_prob: 重启概率
-    - max_steps: 最大步数
-    - top_k: 采样邻居数量
-
-    返回:
-    - 邻接矩阵，仅包含采样的邻居
-    """
-    # 修复：使用 G.number_of_nodes() 代替 G.graph['num_nodes']
-    num_nodes = G.number_of_nodes()
-    adj = np.zeros((num_nodes, num_nodes))
-
-    # 从图中获取预计算的转移矩阵
-    P = G.graph['P']
-
-    # 批量处理
-    p_batch = np.zeros((len(node_indices), num_nodes))
-    for i, node_idx in enumerate(node_indices):
-        p = np.zeros(num_nodes)
-        p[node_idx] = 1.0
-        p_batch[i] = p
-
-    # 批量RWR迭代
-    for _ in range(max_steps):
-        p_batch = (1 - restart_prob) * p_batch @ P.toarray() + restart_prob * np.eye(num_nodes)[node_indices]
-
-    # 构建采样邻接矩阵
-    for i, node_idx in enumerate(node_indices):
-        # 获取重要邻居
-        neighbor_indices = np.argsort(-p_batch[i])[:top_k]
-
-        # 仅保留top_k邻居（排除自身）
-        for neighbor in neighbor_indices:
-            if neighbor != node_idx:
-                adj[node_idx, neighbor] = 1
-                adj[neighbor, node_idx] = 1  # 无向图
-
-    return adj
 
 def rwr_sampling(G, node_indices, restart_prob=0.2, max_steps=20, top_k=10):
     """
