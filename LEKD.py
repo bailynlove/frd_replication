@@ -772,7 +772,7 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
     )
 
     # 训练参数
-    num_epochs = 20
+    num_epochs = 5
     best_val_f1 = 0
     early_stop_counter = 0
     early_stop_patience = 5
