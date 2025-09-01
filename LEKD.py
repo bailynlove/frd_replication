@@ -651,11 +651,9 @@ class ReviewDataset(Dataset):
         self.df = df.loc[indices].reset_index(drop=True)
         self.knowledge_list = knowledge_list
 
-        # 用户特征列
-        self.user_features = [
-            'author_friend_sum', 'author_review_sum',
-            'author_photo_sum', 'author_char_id'
-        ]
+        # 修复：移除author_char_id，它是一个字符串ID，不是数值特征
+        # 原始错误代码: self.user_features = ['author_friend_sum', 'author_review_sum', 'author_photo_sum', 'author_char_id']
+        self.user_features = ['author_friend_sum', 'author_review_sum', 'author_photo_sum']
 
         # 商家特征列
         self.biz_features = [
@@ -670,6 +668,7 @@ class ReviewDataset(Dataset):
         row = self.df.iloc[idx]
 
         # 获取特征
+        # 确保只选择数值特征
         user_features = row[self.user_features].values.astype(np.float32)
         biz_features = row[self.biz_features].values.astype(np.float32)
 
