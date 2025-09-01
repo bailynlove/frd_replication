@@ -346,15 +346,16 @@ class TextEncoder(nn.Module):
         self.tokenizer = RobertaTokenizer.from_pretrained(pretrained_model)
         self.roberta = RobertaModel.from_pretrained(pretrained_model)
         self.hidden_size = self.roberta.config.hidden_size
-        self.device = next(self.roberta.parameters()).device
+        self.device = next(self.roberta.parameters()).device  # 获取模型初始设备
 
         # 冻结RoBERTa参数（可选）
         for param in self.roberta.parameters():
             param.requires_grad = False
 
     def to(self, device):
-        """移动模型到指定设备"""
+        """确保模型移动到指定设备"""
         self.roberta = self.roberta.to(device)
+        self.device = device
         return super().to(device)
 
     def forward(self, texts):
@@ -366,6 +367,8 @@ class TextEncoder(nn.Module):
             truncation=True,
             max_length=256
         )
+
+        # 使用模型所在设备
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
@@ -382,7 +385,6 @@ class KnowledgeProcessor(nn.Module):
         super(KnowledgeProcessor, self).__init__()
         self.text_encoder = text_encoder
         self.hidden_size = hidden_size
-        self.device = next(text_encoder.parameters()).device
 
         # 知识特征处理网络
         self.knowledge_encoder = nn.Sequential(
@@ -400,14 +402,18 @@ class KnowledgeProcessor(nn.Module):
 
     def to(self, device):
         """移动模型到指定设备"""
+        self.text_encoder.to(device)
         self.knowledge_encoder = self.knowledge_encoder.to(device)
         self.mi_bottleneck = self.mi_bottleneck.to(device)
         return super().to(device)
 
     def forward(self, reviews, knowledge_list):
         """处理知识"""
+        # 确保文本编码器在正确设备上
+        device = next(self.knowledge_encoder.parameters()).device
+        self.text_encoder.to(device)
+
         # 编码原始评论
-        self.text_encoder.to(self.device)
         review_embeddings = self.text_encoder(reviews)
 
         # 创建知识增强的评论表示
@@ -419,12 +425,14 @@ class KnowledgeProcessor(nn.Module):
             # 编码知识文本
             with torch.no_grad():
                 knowledge_embedding = self.text_encoder([knowledge_text])
+                # 确保知识嵌入在相同设备上
+                knowledge_embedding = knowledge_embedding.to(device)
 
             # 合并原始评论和知识
             combined = torch.cat([review_embeddings[i], knowledge_embedding[0]], dim=0)
             knowledge_enhanced.append(combined)
 
-        knowledge_enhanced = torch.stack(knowledge_enhanced)
+        knowledge_enhanced = torch.stack(knowledge_enhanced).to(device)
 
         # 通过知识编码器
         z_B = self.knowledge_encoder(knowledge_enhanced)
@@ -735,6 +743,10 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
         collate_fn=collate_fn
     )
 
+    # 初始化设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
     # 初始化模型
     text_encoder = TextEncoder('roberta-base')
     model = LEKDModel(
@@ -744,8 +756,8 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
         hidden_size=256
     )
 
-    # 移动到GPU
-    model.to(device)
+    # 关键修复：确保将整个模型移动到设备上
+    model = model.to(device)
 
     # 优化器
     optimizer = torch.optim.AdamW(
@@ -754,13 +766,10 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
         weight_decay=1e-4
     )
 
-    # 学习率调度器 - 修复：移除verbose参数
+    # 学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 'max', patience=2, factor=0.5
     )
-
-    # 初始化学习率记录，用于手动打印学习率变化
-    last_lr = optimizer.param_groups[0]['lr']
 
     # 训练参数
     num_epochs = 20
@@ -782,7 +791,7 @@ def train_model(df, train_idx, val_idx, test_idx, train_knowledge, val_knowledge
         all_train_labels = []
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]"):
-            # 准备数据
+            # 准备数据 - 确保移动到正确设备
             reviews = batch['reviews']
             user_features = batch['user_features'].to(device)
             biz_features = batch['biz_features'].to(device)
