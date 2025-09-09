@@ -122,34 +122,42 @@ class MGMPDataset:
 # --- 2. Model Architecture ---
 
 # Module 2a: Multi-granularity Semantic Learning
+# Module 2a: Multi-granularity Semantic Learning
 class MultiGranularitySemanticModule(nn.Module):
-    def __init__(self, num_news, vocab_size, embed_dim, config):
+    def __init__(self, num_news, vocab_size, embed_dim, cnn_kernel_sizes, cnn_out_channels, attn_heads, dropout,
+                 max_sent_len, device):
         super().__init__()
-        self.config = config
+
+        # --- 将所有需要的参数保存为模块属性 ---
+        self.max_sent_len = max_sent_len
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.device = device
+
         # Initial news embeddings (randomly initialized as per paper)
-        self.news_embeds = nn.Embedding(num_news, embed_dim, padding_idx=None)
+        self.news_embeds = nn.Embedding(num_news, embed_dim)
 
         # Fine-grained: Multi-head attention to learn word embeddings
-        self.word_attention = nn.MultiheadAttention(embed_dim, config.ATTN_HEADS, batch_first=True)
+        self.word_attention = nn.MultiheadAttention(embed_dim, attn_heads, batch_first=True)
 
         # Coarse-grained: CNN for document embeddings
         self.cnn = nn.ModuleList([
-            nn.Conv1d(embed_dim, config.CNN_OUT_CHANNELS, k) for k in config.CNN_KERNEL_SIZES
+            nn.Conv1d(embed_dim, cnn_out_channels, k) for k in cnn_kernel_sizes
         ])
-        self.dropout = nn.Dropout(config.DROPOUT)
-        self.fc = nn.Linear(len(config.CNN_KERNEL_SIZES) * config.CNN_OUT_CHANNELS, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(len(cnn_kernel_sizes) * cnn_out_channels, embed_dim)
 
+    # 这是修正后的 forward 方法
     def forward(self, all_news_ids, word_news_map, news_word_map):
         # --- Fine-grained Step ---
-        # This part is computationally heavy. We compute it once per epoch or pre-compute.
-        # Here, we do it on the fly for clarity.
-
-        all_word_embeds = torch.zeros(self.config.vocab_size, self.config.EMBED_DIM).to(self.config.DEVICE)
+        # --- 这是关键修改 ---
+        # 从模块的属性 (self) 中获取 vocab_size 和 embed_dim，而不是 config
+        all_word_embeds = torch.zeros(self.vocab_size, self.embed_dim).to(self.device)
 
         for word_idx, news_indices in word_news_map.items():
             if not news_indices: continue
             # Get embeddings of all news articles this word appears in
-            news_ids_tensor = torch.LongTensor(news_indices).to(self.config.DEVICE)
+            news_ids_tensor = torch.LongTensor(news_indices).to(self.device)
             context_news_embeds = self.news_embeds(news_ids_tensor).unsqueeze(0)  # (1, num_news, dim)
 
             # Use a dummy query (e.g., average) to attend over the context
@@ -165,10 +173,10 @@ class MultiGranularitySemanticModule(nn.Module):
             [torch.LongTensor(seq) for seq in news_word_map],
             batch_first=True,
             padding_value=0
-        )[:, :self.config.MAX_SENT_LEN]
+        )[:, :self.max_sent_len]
 
         # Get embeddings for all words in all news
-        doc_word_embeds = F.embedding(padded_news_word_map.to(self.config.DEVICE), all_word_embeds)
+        doc_word_embeds = F.embedding(padded_news_word_map.to(self.device), all_word_embeds)
 
         x = doc_word_embeds.permute(0, 2, 1)  # (batch, dim, len)
 
@@ -254,7 +262,15 @@ class MGMP(nn.Module):
 
         # Semantic Module
         self.semantic_module = MultiGranularitySemanticModule(
-            data_handler.num_news, config.vocab_size, config.EMBED_DIM, config
+            num_news=data_handler.num_news,
+            vocab_size=data_handler.vocab_size,
+            embed_dim=config.EMBED_DIM,
+            cnn_kernel_sizes=config.CNN_KERNEL_SIZES,
+            cnn_out_channels=config.CNN_OUT_CHANNELS,
+            attn_heads=config.ATTN_HEADS,
+            dropout=config.DROPOUT,
+            max_sent_len=config.MAX_SENT_LEN,
+            device=config.DEVICE
         )
 
         # Structural Module
