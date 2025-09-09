@@ -28,7 +28,7 @@ class Config:
 
     # Training Hyperparameters
     EPOCHS = 5
-    BATCH_SIZE = 32
+    BATCH_SIZE = 16
     LEARNING_RATE = 0.001
     WEIGHT_DECAY = 1e-5
 
