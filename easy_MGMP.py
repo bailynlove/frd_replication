@@ -115,16 +115,28 @@ class MGMPDataset:
                                               random_state=42)  # 0.1 of original
         return train_idx, val_idx, test_idx
 
+
 class NewsDataset(Dataset):
-    def __init__(self, df, indices):
+    def __init__(self, df, indices, news_word_map, max_len):
         self.labels = df.iloc[indices]['label'].values
         self.indices = indices
+
+        # 预处理新闻的词索引序列
+        self.news_sequences = []
+        for idx in indices:
+            seq = news_word_map[idx]
+            # 填充和截断
+            if len(seq) > max_len:
+                seq = seq[:max_len]
+            else:
+                seq = seq + [0] * (max_len - len(seq))
+            self.news_sequences.append(torch.LongTensor(seq))
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.indices[idx], self.labels[idx]
+        return self.indices[idx], self.labels[idx], self.news_sequences[idx]
 
 # 它现在只是一个简单的CNN编码器，不再处理词级别注意力
 
@@ -187,20 +199,46 @@ def precompute_epoch_features(data_handler, initial_news_embeds, word_attention_
 
 # --- 修改后的结构模块 ---
 
+# --- 升级后的结构模块 ---
 class MetaPathInteractionModule(nn.Module):
     def __init__(self, embed_dim, config):
         super().__init__()
         self.config = config
-        self.mhsa_nsn = nn.MultiheadAttention(embed_dim, config.ATTN_HEADS, batch_first=True)
-        self.mhsa_nun = nn.MultiheadAttention(embed_dim, config.ATTN_HEADS, batch_first=True)
+        # GRU来编码一个元路径实例 (路径长度为3)
+        self.path_encoder = nn.GRU(
+            input_size=embed_dim,
+            hidden_size=embed_dim,
+            num_layers=1,
+            batch_first=True
+        )
 
-    def forward(self, nsn_instances, nun_instances):
-        # 输入: (batch_size, num_samples, dim)
-        nsn_attn, _ = self.mhsa_nsn(nsn_instances, nsn_instances, nsn_instances)
-        nun_attn, _ = self.mhsa_nun(nun_instances, nun_instances, nun_instances)
+        # 多头自注意力机制，用于聚合一个新闻的所有元路径实例
+        self.mhsa = nn.MultiheadAttention(embed_dim, config.ATTN_HEADS, batch_first=True, dropout=config.DROPOUT)
+        self.norm = nn.LayerNorm(embed_dim)
 
-        # 返回聚合后的每个元路径的表示
-        return nsn_attn.mean(dim=1), nun_attn.mean(dim=1)
+    def forward(self, path_instances_embeds):
+        # 输入 path_instances_embeds: (batch_size, num_samples, path_len, dim)
+        batch_size, num_samples, path_len, dim = path_instances_embeds.shape
+
+        # 展平以适配GRU
+        path_instances_flat = path_instances_embeds.view(batch_size * num_samples, path_len, dim)
+
+        # GRU编码，我们取最后一个时间步的 hidden state 作为整个路径的编码
+        _, hidden_state = self.path_encoder(path_instances_flat)
+        # hidden_state: (num_layers, batch*num_samples, dim) -> (batch*num_samples, dim)
+        encoded_paths = hidden_state.squeeze(0)
+
+        # 恢复形状: (batch_size, num_samples, dim)
+        encoded_paths = encoded_paths.view(batch_size, num_samples, dim)
+
+        # 自注意力聚合
+        attn_output, _ = self.mhsa(encoded_paths, encoded_paths, encoded_paths)
+
+        # 残差连接和归一化
+        aggregated_embeds = self.norm(encoded_paths + attn_output)
+
+        # 返回每个新闻聚合后的元路径表示 (取平均)
+        return aggregated_embeds.mean(dim=1)
 
 
 # 新增一个函数，用于预采样元路径
@@ -251,29 +289,34 @@ def pre_sample_meta_paths(data_handler, news_embeds, user_embeds, source_embeds,
 
 # --- 修改后的主模型 ---
 
+# --- 最终版主模型 ---
 class MGMP(nn.Module):
     def __init__(self, data_handler, config):
         super().__init__()
         self.config = config
+        self.data_handler = data_handler
 
-        # --- 定义所有可学习的参数 ---
-        # 初始新闻嵌入是可学习的
-        self.initial_news_embeds = nn.Embedding(data_handler.num_news, config.EMBED_DIM)
-        # 细粒度学习中的注意力模块
-        self.word_attention = nn.MultiheadAttention(config.EMBED_DIM, config.ATTN_HEADS, batch_first=True)
-        # 粗粒度学习的CNN编码器
-        self.coarse_encoder = CoarseGrainedEncoder(config.EMBED_DIM, config)
-
-        # 结构化学习的节点嵌入
+        # --- 1. 所有可学习的嵌入层 ---
+        self.news_embeds = nn.Embedding(data_handler.num_news, config.EMBED_DIM)
         self.user_embeds = nn.Embedding(data_handler.num_users, config.EMBED_DIM)
         self.source_embeds = nn.Embedding(data_handler.num_sources, config.EMBED_DIM)
-        # 结构化学习的交互模块
-        self.structural_module = MetaPathInteractionModule(config.EMBED_DIM, config)
+        self.word_embeds = nn.Embedding(data_handler.vocab_size, config.EMBED_DIM, padding_idx=0)
 
-        # 聚合和分类
+        # --- 2. 语义学习模块 ---
+        # 细粒度词向量学习的注意力模块
+        self.word_attention = nn.MultiheadAttention(config.EMBED_DIM, config.ATTN_HEADS, batch_first=True)
+        # 粗粒度文档学习的CNN编码器
+        self.coarse_encoder = CoarseGrainedEncoder(config.EMBED_DIM, config)
+
+        # --- 3. 结构学习模块 ---
+        self.interaction_nsn = MetaPathInteractionModule(config.EMBED_DIM, config)
+        self.interaction_nun = MetaPathInteractionModule(config.EMBED_DIM, config)
+
+        # --- 4. 聚合与分类 ---
         self.meta_path_attention = nn.Sequential(
-            nn.Linear(config.EMBED_DIM, 1),
-            nn.Tanh()
+            nn.Linear(config.EMBED_DIM, config.EMBED_DIM // 2),
+            nn.Tanh(),
+            nn.Linear(config.EMBED_DIM // 2, 1)
         )
         self.classifier = nn.Sequential(
             nn.Linear(config.EMBED_DIM * 2, config.EMBED_DIM),
@@ -282,23 +325,88 @@ class MGMP(nn.Module):
             nn.Linear(config.EMBED_DIM, 2)
         )
 
-    def forward(self, news_ids, precomputed_doc_embeds, precomputed_nsn, precomputed_nun):
-        # 1. 获取语义嵌入
-        # 从预计算的文档词向量序列中，通过CNN编码器得到最终语义表示
-        batch_semantic_embeds = self.coarse_encoder(precomputed_doc_embeds[news_ids])
+    def _get_fine_grained_word_embeds(self, word_indices):
+        """为一批词计算其细粒度表示"""
+        word_embeds_list = []
+        for word_idx in word_indices:
+            news_context_ids = self.data_handler.word_news_map.get(word_idx.item())
+            if not news_context_ids:
+                # 如果词没有上下文（不太可能，除非是罕见词），用其自身的原始嵌入
+                word_embeds_list.append(self.word_embeds(word_idx))
+                continue
 
-        # 2. 获取结构嵌入
-        # 直接从预采样的元路径实例中获取
-        batch_nsn_instances = precomputed_nsn[news_ids]
-        batch_nun_instances = precomputed_nun[news_ids]
-        nsn_embeds, nun_embeds = self.structural_module(batch_nsn_instances, batch_nun_instances)
+            news_context_ids = torch.LongTensor(news_context_ids[:50]).to(self.config.DEVICE)  # 限制上下文数量以防OOM
+            context_news_embeds = self.news_embeds(news_context_ids).unsqueeze(0)
 
-        # 3. 聚合与分类
+            query = self.word_embeds(word_idx).unsqueeze(0).unsqueeze(0)  # (1, 1, dim)
+            attn_output, _ = self.word_attention(query, context_news_embeds, context_news_embeds)
+            word_embeds_list.append(attn_output.squeeze(0).squeeze(0))
+
+        return torch.stack(word_embeds_list)
+
+    def _sample_meta_paths_for_batch(self, news_ids, path_type):
+        """为当前批次高效采样元路径并获取嵌入"""
+        batch_instances = []
+        for n_id in news_ids:
+            node_instances = []
+            if path_type == 'NSN':
+                adj1, adj2, embed1, embed2 = self.data_handler.news_source_adj, self.data_handler.source_news_adj, self.source_embeds, self.news_embeds
+            else:  # NUN
+                adj1, adj2, embed1, embed2 = self.data_handler.news_user_adj, self.data_handler.user_news_adj, self.user_embeds, self.news_embeds
+
+            for _ in range(self.config.META_PATHS_SAMPLES):
+                if not adj1.get(n_id.item()): continue
+                neighbor1_idx = random.choice(adj1[n_id.item()])
+                if not adj2.get(neighbor1_idx) or len(adj2[neighbor1_idx]) < 2: continue
+                end_node_idx = random.choice([n for n in adj2[neighbor1_idx] if n != n_id.item()])
+
+                # 获取路径中节点的嵌入
+                start_embed = self.news_embeds(n_id)
+                n1_embed = embed1(torch.LongTensor([neighbor1_idx]).to(self.config.DEVICE)).squeeze(0)
+                end_embed = embed2(torch.LongTensor([end_node_idx]).to(self.config.DEVICE)).squeeze(0)
+                node_instances.append(torch.stack([start_embed, n1_embed, end_embed]))
+
+            if not node_instances:
+                node_instances.append(torch.zeros(3, self.config.EMBED_DIM).to(self.config.DEVICE))
+
+            # 填充以确保每个新闻的采样数量一致
+            while len(node_instances) < self.config.META_PATHS_SAMPLES:
+                node_instances.append(torch.zeros(3, self.config.EMBED_DIM).to(self.config.DEVICE))
+
+            batch_instances.append(torch.stack(node_instances))
+
+        return torch.stack(batch_instances)
+
+    def forward(self, news_ids, news_word_indices):
+        # --- 1. 语义学习 ---
+        # 获取当前批次新闻中所有不重复的词
+        unique_word_indices = torch.unique(news_word_indices.flatten())
+        # 计算这些词的细粒度嵌入
+        fine_grained_embeds = self._get_fine_grained_word_embeds(unique_word_indices)
+
+        # 创建一个临时的词嵌入表，用于当前批次
+        temp_word_embed_table = self.word_embeds.weight.clone()
+        temp_word_embed_table[unique_word_indices] = fine_grained_embeds
+
+        # 使用更新后的词嵌入表来获取文档的词序列嵌入
+        doc_word_embeds = F.embedding(news_word_indices, temp_word_embed_table, padding_idx=0)
+
+        # 通过CNN得到最终语义表示
+        semantic_embeds = self.coarse_encoder(doc_word_embeds)
+
+        # --- 2. 结构学习 ---
+        nsn_instances = self._sample_meta_paths_for_batch(news_ids, 'NSN')
+        nun_instances = self._sample_meta_paths_for_batch(news_ids, 'NUN')
+
+        nsn_embeds = self.interaction_nsn(nsn_instances)
+        nun_embeds = self.interaction_nun(nun_instances)
+
+        # --- 3. 聚合与分类 ---
         meta_path_stack = torch.stack([nsn_embeds, nun_embeds], dim=1)
         attn_weights = F.softmax(self.meta_path_attention(meta_path_stack), dim=1)
         aggregated_structural_embeds = (meta_path_stack * attn_weights).sum(dim=1)
 
-        combined_embeds = torch.cat([batch_semantic_embeds, aggregated_structural_embeds], dim=1)
+        combined_embeds = torch.cat([semantic_embeds, aggregated_structural_embeds], dim=1)
         logits = self.classifier(combined_embeds)
 
         return logits
@@ -306,29 +414,31 @@ class MGMP(nn.Module):
 
 # --- 修改后的训练和主函数 ---
 
-def train(model, data_loader, optimizer, criterion, precomputed_doc_embeds, precomputed_nsn, precomputed_nun, device):
+def train(model, data_loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
-    for news_ids, labels in tqdm(data_loader, desc="Training"):
-        news_ids, labels = news_ids.to(device), labels.to(device)
+    for news_ids, labels, news_sequences in tqdm(data_loader, desc="Training"):
+        news_ids, labels, news_sequences = news_ids.to(device), labels.to(device), news_sequences.to(device)
 
         optimizer.zero_grad()
-        logits = model(news_ids, precomputed_doc_embeds, precomputed_nsn, precomputed_nun)
+        logits = model(news_ids, news_sequences)
         loss = criterion(logits, labels)
         loss.backward()
+        # 梯度裁剪，防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
     return total_loss / len(data_loader)
 
 
-def evaluate(model, data_loader, precomputed_doc_embeds, precomputed_nsn, precomputed_nun, device):
+def evaluate(model, data_loader, device):
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
-        for news_ids, labels in tqdm(data_loader, desc="Evaluating"):
-            news_ids, labels = news_ids.to(device), labels.to(device)
-            logits = model(news_ids, precomputed_doc_embeds, precomputed_nsn, precomputed_nun)
+        for news_ids, labels, news_sequences in tqdm(data_loader, desc="Evaluating"):
+            news_ids, labels, news_sequences = news_ids.to(device), labels.to(device), news_sequences.to(device)
+            logits = model(news_ids, news_sequences)
             preds = logits.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -346,9 +456,10 @@ def main():
     data_handler = MGMPDataset(config)
     train_idx, val_idx, test_idx = data_handler.get_train_val_test_split()
 
-    train_dataset = NewsDataset(data_handler.df, train_idx)
-    val_dataset = NewsDataset(data_handler.df, val_idx)
-    test_dataset = NewsDataset(data_handler.df, test_idx)
+    # 将 news_word_map 和 max_len 传入 Dataset
+    train_dataset = NewsDataset(data_handler.df, train_idx, data_handler.news_word_map, config.MAX_SENT_LEN)
+    val_dataset = NewsDataset(data_handler.df, val_idx, data_handler.news_word_map, config.MAX_SENT_LEN)
+    test_dataset = NewsDataset(data_handler.df, test_idx, data_handler.news_word_map, config.MAX_SENT_LEN)
 
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE)
