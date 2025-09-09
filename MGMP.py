@@ -27,8 +27,8 @@ class Config:
     DROPOUT = 0.5
 
     # Training Hyperparameters
-    EPOCHS = 30
-    BATCH_SIZE = 64
+    EPOCHS = 5
+    BATCH_SIZE = 32
     LEARNING_RATE = 0.001
     WEIGHT_DECAY = 1e-5
 
