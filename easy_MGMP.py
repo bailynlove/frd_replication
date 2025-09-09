@@ -27,7 +27,7 @@ class Config:
     DROPOUT = 0.5
 
     # Training Hyperparameters
-    EPOCHS = 30
+    EPOCHS = 5
     BATCH_SIZE = 32  # 调整为您显存合适的批次大小
     LEARNING_RATE = 0.001
     WEIGHT_DECAY = 1e-5
