@@ -31,7 +31,7 @@ class Config:
     THRESHOLD = 0.5  # 急性阈值
 
     # 训练超参数
-    PRETRAIN_EPOCHS = 5
+    PRETRAIN_EPOCHS = 10
     PRETRAIN_LR = 0.001
     TRAIN_EPOCHS = 30
     TRAIN_LR = 0.001
