@@ -23,6 +23,9 @@ class Config:
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 论文提到 ReCOVery 的文本阈值在 1/37.5 附近，我们取一个中间值
+    TEXT_THRESHOLD = 1.0 / 50.0
+    VISUAL_THRESHOLD = 1.0 / 700.0  # 视觉特征维度更高，阈值比例应更小
     # 模型超参数
     IMG_SIZE = 128
     EMBED_DIM = 100
