@@ -34,10 +34,11 @@ class Config:
     PRETRAIN_EPOCHS = 10
     PRETRAIN_LR = 0.001
     TRAIN_EPOCHS = 30
-    TRAIN_LR = 0.001
+    TRAIN_LR = 0.0005
     BATCH_SIZE = 32
     ALPHA = 1.0  # 主损失权重
     BETA = 1.0  # 对抗损失权重
+    DROPOUT = 0.5
 
 
 print(f"Using device: {Config.DEVICE}")
@@ -146,18 +147,34 @@ class TFE(nn.Module):
 
 
 # --- 5. 核心模型: mEXACT ---
+# --- 升级后的 AcuteThresholding 模块 ---
 class AcuteThresholding(nn.Module):
     def __init__(self, threshold):
         super().__init__()
-        self.threshold = threshold
+        # 这里的 threshold 不再是直接比较的值，而是作为计算 xo 的一个因子
+        # 为了简单且有效，我们将其设为一个固定的经验值。论文中提到它是通过 hyperopt 找到的。
+        self.threshold_factor = threshold  # 例如，论文中提到的 1/37.5, 1/75 等
 
     def forward(self, x):
-        # x is a feature matrix (batch_size, feature_dim)
+        # x 是一个特征矩阵 (batch_size, feature_dim)
+
+        # 1. 计算显著性分数
         significance_scores = F.softmax(x, dim=-1)
 
-        # Create mask for Least Significant (LS) features
-        mask_ls = (significance_scores < self.threshold).float()
+        # 2. 对每个样本（每一行）计算其阈值 xo
+        # 论文原文是 "empirically defined threshold value"
+        # 一个合理的解释是，这个阈值与特征本身有关
+        # 这里我们设定为每行总和的一个比例
+        xo = torch.sum(significance_scores, dim=-1, keepdim=True) * self.threshold_factor
 
+        # 3. 创建 LS (Least Significant) 掩码
+        # 论文描述：如果一个特征向量（代表一个句子或图片区域）的显著性分数总和 >= xo，
+        # 则它属于 MS，否则属于 LS。
+        # 这里我们将这个思想应用到特征向量的每个元素上，即如果一个元素的分数 < xo，则属于LS
+        # 这是一种更细粒度的实现，但思想一致。
+        mask_ls = (significance_scores < xo).float()
+
+        # 4. 分离出 LS 特征
         features_ls = x * mask_ls
         return features_ls
 
@@ -167,50 +184,46 @@ class mEXACT(nn.Module):
         super().__init__()
         self.config = config
 
-        # VFE
+        # VFE (加载逻辑不变)
         autoencoder = ConvAutoencoder()
-        # 加载预训练的编码器权重
         autoencoder.encoder.load_state_dict(torch.load(config.ENCODER_WEIGHTS_PATH))
         self.vfe = autoencoder.encoder
-        # 冻结VFE的参数
         for param in self.vfe.parameters():
             param.requires_grad = False
 
         # TFE
         self.tfe = TFE(vocab_size, config.EMBED_DIM, config.TEXT_HIDDEN_DIM)
 
-        # Acute Thresholding
-        self.at_visual = AcuteThresholding(config.THRESHOLD)
-        self.at_textual = AcuteThresholding(config.THRESHOLD)
+        # Acute Thresholding (使用新的阈值)
+        self.at_visual = AcuteThresholding(config.VISUAL_THRESHOLD)
+        self.at_textual = AcuteThresholding(config.TEXT_THRESHOLD)
 
-        # Prediction
+        # --- 升级: 使用更强大的两层 FC 预测器 ---
         combined_dim = config.VISUAL_FEATURE_DIM + config.TEXT_HIDDEN_DIM * 2
         self.fc = nn.Sequential(
-            nn.Linear(combined_dim, combined_dim // 2),
+            nn.Linear(combined_dim, 512),  # 论文中提到 FC 层的单元数 {512, 256, ...}
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(combined_dim // 2, 1)
+            nn.Dropout(config.DROPOUT),
+            nn.Linear(512, 1)  # 输出一个 logit
         )
 
     def forward(self, images, texts):
-        # 1. Feature Extraction
+        # 1. 特征提取 (不变)
         f_v = self.vfe(images)
         f_t = self.tfe(texts)
 
-        # 2. Acute Thresholding
+        # 2. 急性阈值 (不变)
         f_ls_v = self.at_visual(f_v)
         f_ls_t = self.at_textual(f_t)
 
-        # 3. Model Prediction
-        # First output terminal (full features)
+        # 3. 预测 (不变)
         combined_full = torch.cat([f_v, f_t], dim=1)
-        y_hat = self.fc(combined_full)
+        y_hat_logits = self.fc(combined_full)
 
-        # Second output terminal (LS features)
         combined_ls = torch.cat([f_ls_v, f_ls_t], dim=1)
-        y_hat_prime = self.fc(combined_ls)
+        y_hat_prime_logits = self.fc(combined_ls)
 
-        return torch.sigmoid(y_hat), torch.sigmoid(y_hat_prime)
+        return y_hat_logits, y_hat_prime_logits
 
 
 # --- 6. 训练与评估 ---
@@ -305,7 +318,8 @@ def main():
 
     model = mEXACT(vocab_size, config).to(config.DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.TRAIN_LR)
-    criterion = nn.BCELoss()  # Binary Cross Entropy
+    # --- 修改: 使用数值更稳定的 BCEWithLogitsLoss ---
+    criterion = nn.BCEWithLogitsLoss()
 
     for epoch in range(config.TRAIN_EPOCHS):
         model.train()
@@ -314,26 +328,29 @@ def main():
             images, texts, labels = images.to(config.DEVICE), texts.to(config.DEVICE), labels.to(
                 config.DEVICE).float().unsqueeze(1)
 
-            y_hat, y_hat_prime = model(images, texts)
+            y_hat_logits, y_hat_prime_logits = model(images, texts)
 
-            loss_main = criterion(y_hat, labels)
-            loss_adv = criterion(y_hat_prime, 1 - labels)  # 对抗损失
+            loss_main = criterion(y_hat_logits, labels)
+            loss_adv = criterion(y_hat_prime_logits, 1 - labels)  # 对抗损失
 
             loss = config.ALPHA * loss_main + config.BETA * loss_adv
 
             optimizer.zero_grad()
             loss.backward()
+            # --- 新增: 梯度裁剪，防止训练不稳定 ---
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
 
-        # 评估
+        # 评估逻辑也需要相应修改
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
             for images, texts, labels in val_loader:
                 images, texts = images.to(config.DEVICE), texts.to(config.DEVICE)
-                y_hat, _ = model(images, texts)
-                preds = (y_hat.squeeze() > 0.5).int()
+                y_hat_logits, _ = model(images, texts)
+                # --- 修改: 先 sigmoid 再判断 ---
+                preds = (torch.sigmoid(y_hat_logits).squeeze() > 0.5).int()
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.numpy())
 
@@ -342,15 +359,16 @@ def main():
         print(
             f"Epoch {epoch + 1}, Train Loss: {total_loss / len(train_loader):.4f}, Val Acc: {acc:.4f}, Val F1: {f1:.4f}")
 
-    # 最终测试
+    # 最终测试逻辑也需要相应修改
     print("\n--- Final Evaluation on Test Set ---")
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
         for images, texts, labels in tqdm(test_loader, desc="Testing"):
             images, texts = images.to(config.DEVICE), texts.to(config.DEVICE)
-            y_hat, _ = model(images, texts)
-            preds = (y_hat.squeeze() > 0.5).int()
+            y_hat_logits, _ = model(images, texts)
+            # --- 修改: 先 sigmoid 再判断 ---
+            preds = (torch.sigmoid(y_hat_logits).squeeze() > 0.5).int()
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.numpy())
 
